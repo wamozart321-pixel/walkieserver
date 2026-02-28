@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1
+    <title>Walkie Talkie</title>
+
+    <meta name="theme-color" content="#f6a31d">
+    <meta name="description" content="Walkie Talkie multiplataforma - comunicacion instantanea">
+    <link rel="manifest" href="manifest.json">
+    <link rel="apple-touch-icon" href="icon-192.png">
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;800&family=Rajdhani:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <header class="app-header">
+            <div class="brand-block">
+                <div class="brand-mark">
+                    <img
+                        src="\iconlogo.png"
+                        alt="Walkie Talkie Logo"
+                        class="brand-logo"
+                        onerror="this.style.display='none';this.nextElementSibling.style.display='grid';"
+                    >
+                    <div class="brand-logo-fallback">WT</div>
+                </div>
+                <div class="brand-copy">
+                    <p class="brand-kicker">SQUAD COMMS</p>
+                    <h1 class="logo">Walkie Talkie</h1>
+                </div>
+            </div>
+
+            <div class="connection-status">
+                <span class="status-indicator" id="connectionIndicator"></span>
+                <span id="connectionText">Conectando...</span>
+            </div>
+        </header>
+
+        <div class="auth-panel" id="authPanel">
+            <h2>Conectate al canal</h2>
+            <p class="subtitle">Ingresa tu nombre o entra en modo anonimo</p>
+
+            <div class="input-group">
+                <input type="text" id="usernameInput" placeholder="Tu nombre" maxlength="20">
+                <button id="connectBtn" class="btn-primary">Entrar</button>
+            </div>
+
+            <div class="anonymous-info">
+                <small>Si dejas el nombre vacio se asigna uno automatico</small>
+            </div>
+        </div>
+
+        <div class="main-panel" id="mainPanel" style="display: none;">
+            <div class="channel-info panel">
+                <div class="channel-selector">
+                    <label for="channelSelect">Canal</label>
+                    <select id="channelSelect">
+                        <option value="general">general</option>
+                        <option value="random">random</option>
+                        <option value="soporte">soporte</option>
+                    </select>
+                    <button id="createChannelBtn" class="btn-small" title="Crear canal">+</button>
+                </div>
+
+                <div class="user-count">
+                    <span id="userCount">0</span> conectados
+                </div>
+            </div>
+
+            <section class="users-section panel">
+                <h3>Usuarios en canal</h3>
+                <div class="users-list" id="usersList"></div>
+            </section>
+
+            <section class="ptt-section panel">
+                <button id="pttButton" class="ptt-button" disabled>
+                    <span class="ptt-text">MANTEN PARA HABLAR</span>
+                    <span class="ptt-microphone">PTT</span>
+                </button>
+                <div class="ptt-hint">Mantener presionado para transmitir voz</div>
+            </section>
+
+            <section class="history-section panel">
+                <h3>Historial</h3>
+                <div class="history-list" id="historyList"></div>
+            </section>
+
+            <button id="disconnectBtn" class="btn-secondary">Desconectar</button>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
+</button>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
