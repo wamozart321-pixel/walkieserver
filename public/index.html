@@ -2,13 +2,13 @@
 <html lang="es">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Walkie Talkie</title>
 
     <meta name="theme-color" content="#f6a31d">
     <meta name="description" content="Walkie Talkie multiplataforma - comunicacion instantanea">
-    <link rel="manifest" href="manifest.json">
-    <link rel="apple-touch-icon" href="icon-192.png">
+    <link rel="manifest" href="manifiest.json">
+    <link rel="apple-touch-icon" href="iconlogo.png">
 
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -23,7 +23,7 @@
             <div class="brand-block">
                 <div class="brand-mark">
                     <img
-                        src="\iconlogo.png"
+                        src="/iconlogo.png"
                         alt="Walkie Talkie Logo"
                         class="brand-logo"
                         onerror="this.style.display='none';this.nextElementSibling.style.display='grid';"
@@ -31,8 +31,7 @@
                     <div class="brand-logo-fallback">WT</div>
                 </div>
                 <div class="brand-copy">
-                    <p class="brand-kicker">SQUAD COMMS</p>
-                    <h1 class="logo">Walkie Talkie</h1>
+                    <h1 class="logo">Weasytalkie</h1>
                 </div>
             </div>
 
@@ -43,16 +42,22 @@
         </header>
 
         <div class="auth-panel" id="authPanel">
-            <h2>Conectate al canal</h2>
-            <p class="subtitle">Ingresa tu nombre o entra en modo anonimo</p>
+            <h2>Acceso al canal</h2>
+            <p class="subtitle">Ingresa tu usuario y tu clave personal</p>
 
             <div class="input-group">
-                <input type="text" id="usernameInput" placeholder="Tu nombre" maxlength="20">
+                <input type="text" id="usernameInput" placeholder="Usuario" maxlength="20" autocomplete="username">
+                <input type="password" id="passwordInput" placeholder="Clave" maxlength="80" autocomplete="current-password">
                 <button id="connectBtn" class="btn-primary">Entrar</button>
+                <button id="registerBtn" class="btn-secondary">Registrarse</button>
             </div>
-
-            <div class="anonymous-info">
-                <small>Si dejas el nombre vacio se asigna uno automatico</small>
+            <div class="audio-tools">
+                <label for="audioProfileSelect">Perfil de audio</label>
+                <select id="audioProfileSelect">
+                    <option value="stable">Red mala (estable)</option>
+                    <option value="balanced" selected>Balanceado</option>
+                    <option value="low-latency">Baja latencia</option>
+                </select>
             </div>
         </div>
 
@@ -84,6 +89,7 @@
                     <span class="ptt-microphone">PTT</span>
                 </button>
                 <div class="ptt-hint">Mantener presionado para transmitir voz</div>
+                <div class="audio-stats" id="audioStats">Perfil: balanceado | RTT: -- | Jitter: -- | Cola: --</div>
             </section>
 
             <section class="history-section panel">
@@ -92,13 +98,6 @@
             </section>
 
             <button id="disconnectBtn" class="btn-secondary">Desconectar</button>
-        </div>
-    </div>
-
-    <script src="app.js"></script>
-</body>
-</html>
-</button>
         </div>
     </div>
 

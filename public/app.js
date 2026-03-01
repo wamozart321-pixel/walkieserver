@@ -9,21 +9,25 @@ let currentTransmissionId = null;
 let recordingPcmChunks = [];
 let recordingSampleRate = 16000;
 let currentUser = '';
+let currentPassword = '';
 let currentChannel = 'general';
 let usersInChannel = [];
 let historyMessages = [];
-let selectedContact = null; // Para envío selectivo de audio
+const selectedContacts = new Set(); // Para envio selectivo de audio (multi-contacto)
 // Perfil optimizado: baja latencia en tiempo real
 const IS_MOBILE_DEVICE = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
 const LIVE_PCM_RATE = 16000;
 const HISTORY_WAV_MAX_RATE = 24000;
-const LIVE_PCM_BUFFER_SIZE = IS_MOBILE_DEVICE ? 4096 : 2048; // Móvil: chunks más estables, menos carga de CPU
+const LIVE_PCM_BUFFER_SIZE = IS_MOBILE_DEVICE ? 4096 : 4096; // Móvil: chunks más estables, menos carga de CPU
 const LIVE_PLAYBACK_LEAD_SECONDS = IS_MOBILE_DEVICE ? 0.22 : 0.14; // Jitter buffer inicial un poco más amplio
 const CHUNK_FADE_SECONDS = 0.002; // Fade más corto
 const MAX_PLAYBACK_QUEUE_SECONDS = IS_MOBILE_DEVICE ? 0.9 : 0.7; // Tope de cola antes de recortar
-const PLAYBACK_QUEUE_TRIM_SECONDS = IS_MOBILE_DEVICE ? 0.08 : 0.05; // Recorte gradual, no salto brusco
-// Throttle para PC: limitar velocidad de envío
-const SEND_THROTTLE_MS = IS_MOBILE_DEVICE ? 0 : 15; // PC: envía cada 15ms para no saturar móvil
+const PLAYBACK_QUEUE_TRIM_SECONDS = IS_MOBILE_DEVICE ? 0.08 : 0.05;
+const ADAPTIVE_LEAD_MIN_SECONDS = IS_MOBILE_DEVICE ? 0.18 : 0.10;
+const ADAPTIVE_LEAD_MAX_SECONDS = IS_MOBILE_DEVICE ? 0.35 : 0.25;
+const ADAPTIVE_JITTER_GAIN = 1.8;
+// En tiempo real no conviene saltar frames: evita huecos por descarte.
+const SEND_THROTTLE_MS = 0;
 let lastSendTime = 0;
 const liveAudioQueue = [];
 let isPlayingLiveAudio = false;
@@ -34,6 +38,21 @@ let captureProcessorNode = null;
 let captureSilenceGainNode = null;
 let playbackAudioContext = null;
 let playbackNextTime = 0;
+let playbackLastArrivalTime = 0;
+let playbackInterArrivalJitter = 0;
+let runtimePcmRate = LIVE_PCM_RATE;
+let runtimeBaseLeadSeconds = LIVE_PLAYBACK_LEAD_SECONDS;
+let runtimeMinLeadSeconds = ADAPTIVE_LEAD_MIN_SECONDS;
+let runtimeMaxLeadSeconds = ADAPTIVE_LEAD_MAX_SECONDS;
+let runtimeMaxQueueSeconds = MAX_PLAYBACK_QUEUE_SECONDS;
+let runtimeQueueTrimSeconds = PLAYBACK_QUEUE_TRIM_SECONDS;
+let currentAudioProfile = 'balanced';
+let lastPlaybackQueueSeconds = 0;
+let lastAdaptiveLeadSeconds = LIVE_PLAYBACK_LEAD_SECONDS;
+let lastStatsUpdateMs = 0;
+let pingSentAtMs = 0;
+let lastRttMs = null;
+let pingIntervalId = null;
 // Control de la acumulación de audio en cola
 let maxQueueSize = IS_MOBILE_DEVICE ? 8 : 12;
 let currentTransmissionIdPlaying = null;
@@ -44,7 +63,9 @@ const mainPanel = document.getElementById('mainPanel');
 const connectionIndicator = document.getElementById('connectionIndicator');
 const connectionText = document.getElementById('connectionText');
 const usernameInput = document.getElementById('usernameInput');
+const passwordInput = document.getElementById('passwordInput');
 const connectBtn = document.getElementById('connectBtn');
+const registerBtn = document.getElementById('registerBtn');
 const disconnectBtn = document.getElementById('disconnectBtn');
 const pttButton = document.getElementById('pttButton');
 const pttHint = document.querySelector('.ptt-hint');
@@ -53,11 +74,92 @@ const createChannelBtn = document.getElementById('createChannelBtn');
 const userCount = document.getElementById('userCount');
 const usersList = document.getElementById('usersList');
 const historyList = document.getElementById('historyList');
+const audioProfileSelect = document.getElementById('audioProfileSelect');
+const audioStats = document.getElementById('audioStats');
 const AudioContextClass = window.AudioContext || window.webkitAudioContext;
 
 // Verificar compatibilidad con el navegador
 if (!navigator.mediaDevices || !AudioContextClass) {
     alert('Tu navegador no soporta grabación de audio. Por favor usa Chrome, Edge o Firefox.');
+}
+
+const AUDIO_PROFILE_CONFIG = {
+    stable: {
+        pcmRate: 12000,
+        baseLead: IS_MOBILE_DEVICE ? 0.28 : 0.20,
+        minLead: IS_MOBILE_DEVICE ? 0.24 : 0.16,
+        maxLead: IS_MOBILE_DEVICE ? 0.50 : 0.35,
+        maxQueue: IS_MOBILE_DEVICE ? 1.10 : 0.85,
+        queueTrim: IS_MOBILE_DEVICE ? 0.06 : 0.04
+    },
+    balanced: {
+        pcmRate: 16000,
+        baseLead: LIVE_PLAYBACK_LEAD_SECONDS,
+        minLead: ADAPTIVE_LEAD_MIN_SECONDS,
+        maxLead: ADAPTIVE_LEAD_MAX_SECONDS,
+        maxQueue: MAX_PLAYBACK_QUEUE_SECONDS,
+        queueTrim: PLAYBACK_QUEUE_TRIM_SECONDS
+    },
+    'low-latency': {
+        pcmRate: 16000,
+        baseLead: IS_MOBILE_DEVICE ? 0.18 : 0.10,
+        minLead: IS_MOBILE_DEVICE ? 0.15 : 0.08,
+        maxLead: IS_MOBILE_DEVICE ? 0.30 : 0.20,
+        maxQueue: IS_MOBILE_DEVICE ? 0.70 : 0.50,
+        queueTrim: IS_MOBILE_DEVICE ? 0.10 : 0.07
+    }
+};
+
+function formatMetricMs(valueSeconds) {
+    if (valueSeconds === null || valueSeconds === undefined || Number.isNaN(valueSeconds)) return '--';
+    return `${Math.round(valueSeconds * 1000)}ms`;
+}
+
+function updateAudioStats(force = false) {
+    if (!audioStats) return;
+    const now = performance.now();
+    if (!force && (now - lastStatsUpdateMs) < 500) return;
+    lastStatsUpdateMs = now;
+
+    const jitter = formatMetricMs(playbackInterArrivalJitter);
+    const queue = formatMetricMs(lastPlaybackQueueSeconds);
+    const lead = formatMetricMs(lastAdaptiveLeadSeconds);
+    const rtt = lastRttMs === null ? '--' : `${Math.round(lastRttMs)}ms`;
+    audioStats.textContent = `Perfil: ${currentAudioProfile} | RTT: ${rtt} | Jitter: ${jitter} | Cola: ${queue} | Lead: ${lead}`;
+}
+
+function applyAudioProfile(profileName) {
+    const profile = AUDIO_PROFILE_CONFIG[profileName] || AUDIO_PROFILE_CONFIG.balanced;
+    currentAudioProfile = AUDIO_PROFILE_CONFIG[profileName] ? profileName : 'balanced';
+
+    runtimePcmRate = profile.pcmRate;
+    runtimeBaseLeadSeconds = profile.baseLead;
+    runtimeMinLeadSeconds = profile.minLead;
+    runtimeMaxLeadSeconds = profile.maxLead;
+    runtimeMaxQueueSeconds = profile.maxQueue;
+    runtimeQueueTrimSeconds = profile.queueTrim;
+
+    if (audioProfileSelect) {
+        audioProfileSelect.value = currentAudioProfile;
+    }
+    localStorage.setItem('audio_profile', currentAudioProfile);
+    updateAudioStats(true);
+}
+
+function startPingHeartbeat() {
+    stopPingHeartbeat();
+    pingIntervalId = setInterval(() => {
+        if (!socket || !socket.connected) return;
+        pingSentAtMs = performance.now();
+        socket.emit('ping');
+    }, 5000);
+}
+
+function stopPingHeartbeat() {
+    if (pingIntervalId) {
+        clearInterval(pingIntervalId);
+        pingIntervalId = null;
+    }
 }
 
 // ========== FUNCIONES PRINCIPALES ==========
@@ -66,8 +168,16 @@ if (!navigator.mediaDevices || !AudioContextClass) {
  * Conectar al servidor Socket.IO
  */
 function connectToServer() {
-    const username = usernameInput.value.trim() || `Anon_${Math.floor(Math.random() * 1000)}`;
+    const username = usernameInput.value.trim();
+    const password = (passwordInput?.value || '').trim();
+
+    if (!username || !password) {
+        alert('Ingresa usuario y clave.');
+        return;
+    }
+
     currentUser = username;
+    currentPassword = password;
 
     try {
         socket = io(SERVER_URL, {
@@ -80,58 +190,85 @@ function connectToServer() {
         updateConnectionStatus('connecting');
 
         socket.on('connect', () => {
-            console.log('✅ Conectado al servidor');
+            console.log('Conectado al servidor');
             updateConnectionStatus('connected');
-            
-            // Unirse al canal
+            startPingHeartbeat();
+            pingSentAtMs = performance.now();
+            socket.emit('ping');
+
             socket.emit('join-channel', {
                 userId: currentUser,
+                password: currentPassword,
                 channelName: currentChannel
             });
+        });
 
-            // Mostrar panel principal
+        socket.on('disconnect', () => {
+            console.log('Desconectado del servidor');
+            updateConnectionStatus('disconnected');
+            pttButton.disabled = true;
+            playbackNextTime = 0;
+            playbackLastArrivalTime = 0;
+            playbackInterArrivalJitter = 0;
+            lastPlaybackQueueSeconds = 0;
+            lastAdaptiveLeadSeconds = runtimeBaseLeadSeconds;
+            lastRttMs = null;
+            stopPingHeartbeat();
+            updateAudioStats(true);
+        });
+
+        socket.on('connect_error', (error) => {
+            console.error('Error de conexion:', error);
+            updateConnectionStatus('disconnected');
+            alert('No se pudo conectar al servidor. Verifica que el servidor este corriendo.');
+        });
+
+        socket.on('pong', () => {
+            if (pingSentAtMs > 0) {
+                lastRttMs = performance.now() - pingSentAtMs;
+                pingSentAtMs = 0;
+                updateAudioStats();
+            }
+        });
+
+        socket.on('join-success', (data) => {
+            if (data?.userId) currentUser = data.userId;
+            if (data?.channel) {
+                currentChannel = data.channel;
+                channelSelect.value = data.channel;
+            }
+
             authPanel.style.display = 'none';
             mainPanel.style.display = 'block';
             pttButton.disabled = false;
         });
 
-        socket.on('disconnect', () => {
-            console.log('❌ Desconectado del servidor');
-            updateConnectionStatus('disconnected');
+        socket.on('auth-error', (data) => {
+            alert(data?.message || 'Credenciales invalidas');
+            if (socket) socket.disconnect();
+            authPanel.style.display = 'block';
+            mainPanel.style.display = 'none';
             pttButton.disabled = true;
         });
 
-        socket.on('connect_error', (error) => {
-            console.error('Error de conexión:', error);
-            updateConnectionStatus('disconnected');
-            alert('No se pudo conectar al servidor. Verifica que el servidor esté corriendo.');
-        });
-
-        // Escuchar actualización de usuarios en el canal
         socket.on('channel-users', (users) => {
             usersInChannel = users;
             updateUsersList();
         });
 
-        // Escuchar cuando un usuario se une
         socket.on('user-joined', (data) => {
-            addHistoryMessage('system', `👋 ${data.userId} se unió al canal`);
+            addHistoryMessage('system', `?? ${data.userId} se unio al canal`);
         });
 
-        // Escuchar cuando un usuario se va
         socket.on('user-left', (data) => {
-            addHistoryMessage('system', `👋 ${data.userId} abandonó el canal`);
+            addHistoryMessage('system', `?? ${data.userId} abandono el canal`);
         });
 
-        // Escuchar actividad de voz
         socket.on('voice-activity', (data) => {
             updateUserTalking(data.userId, data.isTalking);
         });
 
-        // Escuchar audio entrante
         socket.on('audio-broadcast', (data) => {
-            // Flujo recomendado: PCM en vivo para baja latencia.
-            // Compatibilidad: si "format" no viene, asumimos pcm16.
             if (data.mode === 'pcm-live') {
                 if (data.transmissionId) {
                     liveTransmissionsReceived.add(data.transmissionId);
@@ -140,7 +277,6 @@ function connectToServer() {
                 return;
             }
 
-            // Flujo heredado: chunks codificados con MediaRecorder.
             if (data.mode === 'live') {
                 if (data.transmissionId) {
                     liveTransmissionsReceived.add(data.transmissionId);
@@ -151,8 +287,6 @@ function connectToServer() {
 
             if (data.mode === 'full') {
                 addHistoryMessage('audio', { user: data.userId, audioData: data.audioData, mimeType: data.mimeType });
-
-                // Fallback: si no hubo audio live en esa transmisión, reproduce el full automáticamente.
                 const hadLive = data.transmissionId && liveTransmissionsReceived.has(data.transmissionId);
                 if (!hadLive) {
                     playAudioClip(data.audioData, data.mimeType);
@@ -162,7 +296,6 @@ function connectToServer() {
                 return;
             }
 
-            // Compatibilidad con clientes antiguos
             enqueueLiveAudio(data.audioData, data.mimeType);
             addHistoryMessage('audio', { user: data.userId, audioData: data.audioData, mimeType: data.mimeType });
         });
@@ -171,6 +304,60 @@ function connectToServer() {
         console.error('Error al conectar:', error);
         updateConnectionStatus('disconnected');
     }
+}
+function registerUser() {
+    const username = usernameInput.value.trim();
+    const password = (passwordInput?.value || '').trim();
+
+    if (!username || !password) {
+        alert('Ingresa usuario y clave para registrarte.');
+        return;
+    }
+
+    if (!/^[a-zA-Z0-9_.-]{3,20}$/.test(username)) {
+        alert('Usuario invalido. Usa 3-20 caracteres: letras, numeros, . _ -');
+        return;
+    }
+
+    if (password.length < 4) {
+        alert('La clave debe tener al menos 4 caracteres.');
+        return;
+    }
+
+    const registerSocket = io(SERVER_URL, {
+        transports: ['websocket'],
+        reconnection: false,
+        timeout: 5000
+    });
+
+    let resolved = false;
+    const cleanup = () => {
+        if (resolved) return;
+        resolved = true;
+        registerSocket.disconnect();
+    };
+
+    registerSocket.on('connect', () => {
+        registerSocket.emit('register-user', {
+            userId: username,
+            password
+        });
+    });
+
+    registerSocket.on('register-success', (data) => {
+        alert(data?.message || 'Usuario creado.');
+        cleanup();
+    });
+
+    registerSocket.on('register-error', (data) => {
+        alert(data?.message || 'No se pudo registrar.');
+        cleanup();
+    });
+
+    registerSocket.on('connect_error', () => {
+        alert('No se pudo conectar para registrar.');
+        cleanup();
+    });
 }
 
 /**
@@ -201,6 +388,13 @@ function updateConnectionStatus(status) {
 function updateUsersList() {
     usersList.innerHTML = '';
     userCount.textContent = usersInChannel.length;
+    const availableUsers = new Set(usersInChannel);
+
+    Array.from(selectedContacts).forEach((user) => {
+        if (!availableUsers.has(user)) {
+            selectedContacts.delete(user);
+        }
+    });
 
     usersInChannel.forEach(user => {
         const userItem = document.createElement('div');
@@ -224,7 +418,7 @@ function updateUsersList() {
         }
         
         // Mostrar indicador si está seleccionado
-        if (user === selectedContact) {
+        if (selectedContacts.has(user)) {
             userItem.classList.add('selected');
             userItem.querySelector('.selected-indicator').style.display = 'inline';
         }
@@ -241,11 +435,14 @@ function updateUsersList() {
  */
 function updatePttButtonState() {
     if (!pttButton) return;
-    
-    if (selectedContact) {
+
+    if (selectedContacts.size > 0) {
         pttButton.disabled = false;
         if (pttHint) {
-            pttHint.innerHTML = `📞 <strong>${selectedContact}</strong><br>Mantener presionado para hablar`;
+            const contacts = Array.from(selectedContacts);
+            const preview = contacts.slice(0, 3).join(', ');
+            const extra = contacts.length > 3 ? ` +${contacts.length - 3}` : '';
+            pttHint.innerHTML = `<strong>${preview}${extra}</strong><br>Mantener presionado para hablar`;
         }
     } else {
         pttButton.disabled = true;
@@ -259,24 +456,18 @@ function updatePttButtonState() {
  * Seleccionar contacto para envío privado de audio
  */
 function selectContact(contactName, contactElement) {
-    // Deseleccionar anterior si existe
-    if (selectedContact) {
-        const prevElement = document.getElementById(`user-${selectedContact}`);
-        if (prevElement) {
-            prevElement.classList.remove('selected');
-            prevElement.querySelector('.selected-indicator').style.display = 'none';
-        }
+    if (selectedContacts.has(contactName)) {
+        selectedContacts.delete(contactName);
+        contactElement.classList.remove('selected');
+        contactElement.querySelector('.selected-indicator').style.display = 'none';
+    } else {
+        selectedContacts.add(contactName);
+        contactElement.classList.add('selected');
+        contactElement.querySelector('.selected-indicator').style.display = 'inline';
     }
-    
-    // Seleccionar nuevo contacto
-    selectedContact = contactName;
-    contactElement.classList.add('selected');
-    contactElement.querySelector('.selected-indicator').style.display = 'inline';
-    
-    // Actualizar estado del botón PTT
+
     updatePttButtonState();
-    
-    console.log(`📞 Contacto seleccionado: ${contactName}`);
+    console.log(`Contactos seleccionados: ${Array.from(selectedContacts).join(', ') || 'ninguno'}`);
 }
 
 /**
@@ -349,7 +540,7 @@ async function startRecording() {
         currentStream = await navigator.mediaDevices.getUserMedia({
             audio: {
                 channelCount: 1,
-                sampleRate: LIVE_PCM_RATE,
+                sampleRate: runtimePcmRate,
                 // Mejor calidad para PTT; evita compresion/agresividad del micro.
                 echoCancellation: false,
                 noiseSuppression: false,
@@ -358,7 +549,7 @@ async function startRecording() {
         });
 
         recordingPcmChunks = [];
-        recordingSampleRate = LIVE_PCM_RATE;
+        recordingSampleRate = runtimePcmRate;
         currentTransmissionId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         isRecording = true;
 
@@ -426,10 +617,11 @@ function finalizeCurrentRecording(transmissionId) {
         const base64Audio = arrayBufferToBase64(wavBuffer);
         const mimeType = 'audio/wav';
 
-        if (socket && socket.connected && selectedContact) {
+        const targetUsers = Array.from(selectedContacts);
+        if (socket && socket.connected && targetUsers.length > 0) {
             socket.emit('audio-stream', {
                 channel: currentChannel,
-                targetUser: selectedContact, // Envío selectivo a contacto específico
+                targetUsers,
                 audioData: base64Audio,
                 mode: 'full',
                 transmissionId,
@@ -465,16 +657,16 @@ function startPcmLiveCapture(stream, transmissionId) {
             if (!isRecording || !socket || !socket.connected) return;
             
             // No enviar audio si no hay contacto seleccionado
-            if (!selectedContact) return;
+            if (selectedContacts.size === 0) return;
 
             const input = event.inputBuffer.getChannelData(0);
             recordingSampleRate = captureAudioContext.sampleRate || LIVE_PCM_RATE;
             recordingPcmChunks.push(float32ToInt16(input));
 
-            const downsampled = downsampleBuffer(input, captureAudioContext.sampleRate, LIVE_PCM_RATE);
+            const downsampled = downsampleBuffer(input, captureAudioContext.sampleRate, runtimePcmRate);
             if (!downsampled || downsampled.length === 0) return;
 
-            // Throttle para PC: no enviar más rápido que cada X ms
+            // En tiempo real no conviene saltar frames: evita huecos por descarte.
             const now = Date.now();
             if (SEND_THROTTLE_MS > 0 && (now - lastSendTime) < SEND_THROTTLE_MS) {
                 return; // Skip este frame, enviar en el próximo
@@ -483,13 +675,14 @@ function startPcmLiveCapture(stream, transmissionId) {
 
             const pcm16 = float32ToInt16(downsampled);
             // Sin compresión para menor overhead; sin volatile para evitar recortes de paquetes.
+            const targetUsers = Array.from(selectedContacts);
             socket.compress(false).emit('audio-stream', {
                 channel: currentChannel,
-                targetUser: selectedContact, // Envío selectivo a un contacto específico
+                targetUsers,
                 audioData: pcm16.buffer,
                 mode: 'pcm-live',
                 format: 'pcm16',
-                sampleRate: LIVE_PCM_RATE,
+                sampleRate: runtimePcmRate,
                 transmissionId
             });
         };
@@ -677,6 +870,23 @@ function int16ToFloat32(int16Buffer) {
     return float32;
 }
 
+
+function clampNumber(value, min, max) {
+    return Math.max(min, Math.min(max, value));
+}
+
+function getAdaptivePlaybackLead(now, chunkDuration) {
+    if (playbackLastArrivalTime > 0) {
+        const interArrival = now - playbackLastArrivalTime;
+        const expected = Math.max(0.001, chunkDuration || 0.04);
+        const delta = Math.abs(interArrival - expected);
+        playbackInterArrivalJitter = (playbackInterArrivalJitter * 0.9) + (delta * 0.1);
+    }
+    playbackLastArrivalTime = now;
+
+    const adaptiveLead = runtimeBaseLeadSeconds + (playbackInterArrivalJitter * ADAPTIVE_JITTER_GAIN);
+    return clampNumber(adaptiveLead, runtimeMinLeadSeconds, runtimeMaxLeadSeconds);
+}
 function playPcmChunk(base64Pcm, sampleRate, transmissionId) {
     if (!AudioContextClass) return;
 
@@ -693,7 +903,7 @@ function playPcmChunk(base64Pcm, sampleRate, transmissionId) {
         if (!pcm16 || pcm16.length === 0) return;
 
         const pcmFloat = int16ToFloat32(pcm16);
-        const buffer = playbackAudioContext.createBuffer(1, pcmFloat.length, sampleRate || LIVE_PCM_RATE);
+        const buffer = playbackAudioContext.createBuffer(1, pcmFloat.length, sampleRate || runtimePcmRate);
         buffer.copyToChannel(pcmFloat, 0, 0);
 
         const source = playbackAudioContext.createBufferSource();
@@ -703,15 +913,18 @@ function playPcmChunk(base64Pcm, sampleRate, transmissionId) {
         gainNode.connect(playbackAudioContext.destination);
 
         const now = playbackAudioContext.currentTime;
-        const minStart = now + LIVE_PLAYBACK_LEAD_SECONDS;
+        const adaptiveLead = getAdaptivePlaybackLead(now, buffer.duration);
+        lastAdaptiveLeadSeconds = adaptiveLead;
+        const minStart = now + adaptiveLead;
         if (playbackNextTime < minStart) {
             playbackNextTime = minStart;
         }
 
         const currentQueue = playbackNextTime - now;
-        if (currentQueue > MAX_PLAYBACK_QUEUE_SECONDS) {
-            // Evita "saltos" audibles: reduce cola en pasos cortos.
-            playbackNextTime = Math.max(minStart, playbackNextTime - PLAYBACK_QUEUE_TRIM_SECONDS);
+        lastPlaybackQueueSeconds = currentQueue;
+        if (currentQueue > runtimeMaxQueueSeconds) {
+            // Evita saltos bruscos: recorta de forma gradual el exceso de cola.
+            playbackNextTime = Math.max(minStart, playbackNextTime - runtimeQueueTrimSeconds);
         }
 
         const startAt = playbackNextTime;
@@ -726,6 +939,7 @@ function playPcmChunk(base64Pcm, sampleRate, transmissionId) {
 
         source.start(startAt);
         playbackNextTime = startAt + buffer.duration;
+        updateAudioStats();
     } catch (err) {
         console.error('Error reproduciendo chunk PCM:', err);
     }
@@ -792,11 +1006,24 @@ function playAudio(audioData, mimeType) {
 
 // Botón conectar
 connectBtn.addEventListener('click', connectToServer);
+if (registerBtn) {
+    registerBtn.addEventListener('click', registerUser);
+}
+if (audioProfileSelect) {
+    audioProfileSelect.addEventListener('change', () => {
+        applyAudioProfile(audioProfileSelect.value);
+    });
+}
 
 // Permitir Enter en el input
 usernameInput.addEventListener('keypress', (e) => {
     if (e.key === 'Enter') connectToServer();
 });
+if (passwordInput) {
+    passwordInput.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') connectToServer();
+    });
+}
 
 // Botón desconectar
 disconnectBtn.addEventListener('click', () => {
@@ -805,8 +1032,11 @@ disconnectBtn.addEventListener('click', () => {
         authPanel.style.display = 'block';
         mainPanel.style.display = 'none';
         usersInChannel = [];
+        selectedContacts.clear();
+        updatePttButtonState();
         historyList.innerHTML = '';
     }
+    stopPingHeartbeat();
 });
 
 // Boton PTT - Pointer events (unifica mouse/touch y evita dobles eventos)
@@ -815,7 +1045,7 @@ function beginPtt(e) {
     if (pttButton.disabled) return;
     
     // Verificar que hay un contacto seleccionado
-    if (!selectedContact) {
+    if (selectedContacts.size === 0) {
         alert('⚠️ Selecciona un contacto primero');
         return;
     }
@@ -852,6 +1082,7 @@ channelSelect.addEventListener('change', () => {
     if (socket && socket.connected) {
         socket.emit('join-channel', {
             userId: currentUser,
+            password: currentPassword,
             channelName: newChannel
         });
         currentChannel = newChannel;
@@ -872,6 +1103,7 @@ createChannelBtn.addEventListener('click', () => {
         if (socket && socket.connected) {
             socket.emit('join-channel', {
                 userId: currentUser,
+                password: currentPassword,
                 channelName: newChannel.trim()
             });
             currentChannel = newChannel.trim();
@@ -882,7 +1114,20 @@ createChannelBtn.addEventListener('click', () => {
 // Prevenir que el botón PTT pierda el foco
 pttButton.addEventListener('contextmenu', (e) => e.preventDefault());
 
+applyAudioProfile(localStorage.getItem('audio_profile') || 'balanced');
+updateAudioStats(true);
+
 console.log(' App lista para usar!');
+
+
+
+
+
+
+
+
+
+
 
 
 
