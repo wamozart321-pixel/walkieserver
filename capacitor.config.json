@@ -1,0 +1,9 @@
+{
+  "appId": "com.weasytalkie.app",
+  "appName": "WeasyTalkie",
+  "webDir": "public",
+  "server": {
+    "url": "https://TU-DOMINIO.onrender.com",
+    "cleartext": false
+  }
+}

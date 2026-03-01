@@ -1,20 +1,45 @@
 {
   "name": "walkie-server",
   "version": "1.0.0",
-  "description": "Servidor para aplicación Walkie-Talkie",
-  "main": "server/index.js",
+  "description": "Servidor para aplicacion Walkie-Talkie",
+  "main": "electron/main.js",
   "scripts": {
     "start": "node server/index.js",
     "dev": "nodemon server/index.js",
-    "prod": "NODE_ENV=production node server/index.js"
+    "prod": "NODE_ENV=production node server/index.js",
+    "desktop": "electron .",
+    "dist:win": "electron-builder --win nsis",
+    "android:sync": "npx cap sync android",
+    "android:open": "npx cap open android",
+    "android:copy": "npx cap copy android"
   },
   "dependencies": {
+    "@capacitor/android": "^8.1.0",
+    "@capacitor/cli": "^8.1.0",
+    "@capacitor/core": "^8.1.0",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
     "selfsigned": "^5.5.0",
     "socket.io": "^4.7.2"
   },
   "devDependencies": {
+    "electron": "^37.3.1",
+    "electron-builder": "^26.0.12",
     "nodemon": "^3.0.1"
+  },
+  "build": {
+    "appId": "com.weasytalkie.desktop",
+    "productName": "WeasyTalkie",
+    "directories": {
+      "output": "dist-desktop"
+    },
+    "files": [
+      "electron/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "public/iconlogo.png"
+    }
   }
 }
