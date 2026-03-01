@@ -4,6 +4,7 @@ const https = require('https');
 const fs = require('fs');
 const { Server } = require('socket.io');
 const path = require('path');
+require('dotenv').config();
 
 // Configuración inicial
 const app = express();
@@ -46,8 +47,43 @@ const io = new Server(server, {
 const SERVER_URL = '';
 const PORT = process.env.PORT || 3000;
 const HOST = '0.0.0.0';  // Esto permite conexiones desde cualquier IP
+const AUTH_USER = process.env.AUTH_USER || 'admin';
+const AUTH_PASS = process.env.AUTH_PASS || 'cambiar-esta-clave';
+
+function parseBasicAuth(authHeader) {
+  if (!authHeader || typeof authHeader !== 'string' || !authHeader.startsWith('Basic ')) {
+    return null;
+  }
+
+  try {
+    const decoded = Buffer.from(authHeader.slice(6), 'base64').toString('utf8');
+    const separatorIndex = decoded.indexOf(':');
+    if (separatorIndex < 0) return null;
+    return {
+      username: decoded.slice(0, separatorIndex),
+      password: decoded.slice(separatorIndex + 1)
+    };
+  } catch (error) {
+    return null;
+  }
+}
+
+function isValidCredential(username, password) {
+  return username === AUTH_USER && password === AUTH_PASS;
+}
+
+function basicAuthMiddleware(req, res, next) {
+  const credentials = parseBasicAuth(req.headers.authorization);
+  if (credentials && isValidCredential(credentials.username, credentials.password)) {
+    return next();
+  }
+
+  res.setHeader('WWW-Authenticate', 'Basic realm=\"WalkieServer\", charset=\"UTF-8\"');
+  return res.status(401).send('Autenticacion requerida');
+}
 
 
+app.use(basicAuthMiddleware);
 app.use(express.static(path.join(__dirname, '../public')));
 
 // Almacenamiento en memoria (luego migraremos a Redis)
@@ -60,6 +96,14 @@ app.get('/health', (req, res) => {
 });
 
 // Gestión de conexiones Socket.IO
+io.engine.use((req, res, next) => {
+  const credentials = parseBasicAuth(req.headers.authorization);
+  if (credentials && isValidCredential(credentials.username, credentials.password)) {
+    return next();
+  }
+  return next(new Error('Unauthorized'));
+});
+
 io.on('connection', (socket) => {
   console.log(`🔌 Cliente conectado: ${socket.id}`);
 
