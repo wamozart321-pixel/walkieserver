@@ -75,14 +75,7 @@ body::after {
     animation: riseIn 0.45s ease-out;
 }
 
-.container::before {
-    content: "";
-    position: absolute;
-    inset: 0;
-    border-radius: inherit;
-    border: 1px solid rgba(255, 214, 137, 0.12);
-    pointer-events: none;
-}
+
 
 .container::-webkit-scrollbar {
     width: 10px;
@@ -224,26 +217,6 @@ body::after {
     color: var(--text-soft);
 }
 
-.audio-tools {
-    margin-top: 12px;
-    display: grid;
-    gap: 6px;
-}
-
-.audio-tools label {
-    color: var(--text-soft);
-    font-size: 0.92rem;
-}
-
-.audio-tools select {
-    border: 1px solid rgba(255, 186, 81, 0.32);
-    background: rgba(18, 12, 5, 0.86);
-    color: var(--text-main);
-    border-radius: 10px;
-    padding: 8px 10px;
-    font-family: 'Rajdhani', sans-serif;
-}
-
 .input-group {
     display: flex;
     gap: 10px;
@@ -319,14 +292,14 @@ input[type="password"]:focus {
 
 .panel {
     border-radius: 18px;
-    padding: 14px;
+    padding: 18px;
     background: linear-gradient(170deg, var(--panel-0), var(--panel-1));
     border: 1px solid rgba(247, 173, 57, 0.22);
 }
 
 .main-panel {
     display: grid;
-    gap: 14px;
+    gap: 22px;
 }
 
 .channel-info {
@@ -446,7 +419,7 @@ input[type="password"]:focus {
 
 .ptt-section {
     display: grid;
-    gap: 8px;
+    gap: 12px;
 }
 
 .ptt-button {
@@ -502,17 +475,6 @@ input[type="password"]:focus {
     text-align: center;
     color: var(--text-muted);
     font-size: 0.85rem;
-}
-
-.audio-stats {
-    text-align: center;
-    color: var(--text-soft);
-    font-size: 0.82rem;
-    letter-spacing: 0.02em;
-    padding: 4px 10px;
-    border-radius: 10px;
-    border: 1px solid rgba(255, 192, 94, 0.18);
-    background: rgba(17, 11, 5, 0.62);
 }
 
 .history-item {
