@@ -257,11 +257,11 @@ function connectToServer() {
         });
 
         socket.on('user-joined', (data) => {
-            addHistoryMessage('system', `?? ${data.userId} se unio al canal`);
+            addHistoryMessage('system', `${data.userId} se unio al canal`);
         });
 
         socket.on('user-left', (data) => {
-            addHistoryMessage('system', `?? ${data.userId} abandono el canal`);
+            addHistoryMessage('system', `${data.userId} abandono el canal`);
         });
 
         socket.on('voice-activity', (data) => {
