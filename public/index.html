@@ -51,14 +51,6 @@
                 <button id="connectBtn" class="btn-primary">Entrar</button>
                 <button id="registerBtn" class="btn-secondary">Registrarse</button>
             </div>
-            <div class="audio-tools">
-                <label for="audioProfileSelect">Perfil de audio</label>
-                <select id="audioProfileSelect">
-                    <option value="stable">Red mala (estable)</option>
-                    <option value="balanced" selected>Balanceado</option>
-                    <option value="low-latency">Baja latencia</option>
-                </select>
-            </div>
         </div>
 
         <div class="main-panel" id="mainPanel" style="display: none;">
@@ -77,6 +69,17 @@
                     <span id="userCount">0</span> conectados
                 </div>
             </div>
+
+            <section class="audio-tools-panel panel">
+                <div class="audio-tools">
+                    <label for="audioProfileSelect">Perfil de audio</label>
+                    <select id="audioProfileSelect">
+                        <option value="stable">Red mala (estable)</option>
+                        <option value="balanced" selected>Balanceado</option>
+                        <option value="low-latency">Baja latencia</option>
+                    </select>
+                </div>
+            </section>
 
             <section class="users-section panel">
                 <h3>Usuarios en canal</h3>

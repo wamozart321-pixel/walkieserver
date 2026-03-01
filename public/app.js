@@ -239,7 +239,7 @@ function connectToServer() {
             }
 
             authPanel.style.display = 'none';
-            mainPanel.style.display = 'block';
+            mainPanel.style.display = 'grid';
             pttButton.disabled = false;
         });
 
