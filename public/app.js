@@ -1,61 +1,35 @@
 // Configuracion
-// Conectar al mismo origen desde el que se sirve la pagina (funciona en PC y movil)
-const SERVER_URL = window.location.origin; // ejemplo: https://192.168.137.1:3000
+const SERVER_URL = window.location.origin;
 let socket = null;
-let currentStream = null;
+let currentStream = null; // Stream del micro (se mantiene vivo entre PTT)
 
 let isRecording = false;
-let currentTransmissionId = null;
-let recordingPcmChunks = [];
-let recordingSampleRate = 16000;
 let currentUser = '';
 let currentPassword = '';
 let currentChannel = 'general';
 let usersInChannel = [];
-let historyMessages = [];
-const selectedContacts = new Set(); // Para envio selectivo de audio (multi-contacto)
-// Perfil optimizado: baja latencia en tiempo real
-const IS_MOBILE_DEVICE = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
-const LIVE_PCM_RATE = 16000;
-const HISTORY_WAV_MAX_RATE = 24000;
-const LIVE_PCM_BUFFER_SIZE = IS_MOBILE_DEVICE ? 4096 : 4096; // Móvil: chunks más estables, menos carga de CPU
-const LIVE_PLAYBACK_LEAD_SECONDS = IS_MOBILE_DEVICE ? 0.22 : 0.14; // Jitter buffer inicial un poco más amplio
-const CHUNK_FADE_SECONDS = 0.002; // Fade más corto
-const MAX_PLAYBACK_QUEUE_SECONDS = IS_MOBILE_DEVICE ? 0.9 : 0.7; // Tope de cola antes de recortar
-const PLAYBACK_QUEUE_TRIM_SECONDS = IS_MOBILE_DEVICE ? 0.08 : 0.05;
-const ADAPTIVE_LEAD_MIN_SECONDS = IS_MOBILE_DEVICE ? 0.18 : 0.10;
-const ADAPTIVE_LEAD_MAX_SECONDS = IS_MOBILE_DEVICE ? 0.35 : 0.25;
-const ADAPTIVE_JITTER_GAIN = 1.8;
-// En tiempo real no conviene saltar frames: evita huecos por descarte.
-const SEND_THROTTLE_MS = 0;
-let lastSendTime = 0;
-const liveAudioQueue = [];
-let isPlayingLiveAudio = false;
-const liveTransmissionsReceived = new Set();
-let captureAudioContext = null;
-let captureSourceNode = null;
-let captureProcessorNode = null;
-let captureSilenceGainNode = null;
-let playbackAudioContext = null;
-let playbackNextTime = 0;
-let playbackLastArrivalTime = 0;
-let playbackInterArrivalJitter = 0;
-let runtimePcmRate = LIVE_PCM_RATE;
-let runtimeBaseLeadSeconds = LIVE_PLAYBACK_LEAD_SECONDS;
-let runtimeMinLeadSeconds = ADAPTIVE_LEAD_MIN_SECONDS;
-let runtimeMaxLeadSeconds = ADAPTIVE_LEAD_MAX_SECONDS;
-let runtimeMaxQueueSeconds = MAX_PLAYBACK_QUEUE_SECONDS;
-let runtimeQueueTrimSeconds = PLAYBACK_QUEUE_TRIM_SECONDS;
-let currentAudioProfile = 'balanced';
-let lastPlaybackQueueSeconds = 0;
-let lastAdaptiveLeadSeconds = LIVE_PLAYBACK_LEAD_SECONDS;
-let lastStatsUpdateMs = 0;
+const selectedContacts = new Set();
+
 let pingSentAtMs = 0;
 let lastRttMs = null;
 let pingIntervalId = null;
-// Control de la acumulación de audio en cola
-let maxQueueSize = IS_MOBILE_DEVICE ? 8 : 12;
-let currentTransmissionIdPlaying = null;
+
+// MediaRecorder solo para guardar historial al soltar PTT
+let mediaRecorder = null;
+let mediaRecorderChunks = [];
+let mediaRecorderMimeType = 'audio/webm';
+
+// WebRTC: audio en tiempo real P2P
+// La conexion se establece al seleccionar un contacto (ANTES de pulsar PTT).
+// PTT solo mutea/desmutea el track de audio = instantaneo.
+const RTC_CONFIG = {
+    iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' }
+    ]
+};
+const rtcPeers = new Map();
+const rtcRemoteAudioEls = new Map();
 
 // Elementos del DOM
 const authPanel = document.getElementById('authPanel');
@@ -76,74 +50,177 @@ const usersList = document.getElementById('usersList');
 const historyList = document.getElementById('historyList');
 const audioProfileSelect = document.getElementById('audioProfileSelect');
 const audioStats = document.getElementById('audioStats');
+const audioProfileHelp = document.getElementById('audioProfileHelp');
 const AudioContextClass = window.AudioContext || window.webkitAudioContext;
 
-// Verificar compatibilidad con el navegador
-if (!navigator.mediaDevices || !AudioContextClass) {
-    alert('Tu navegador no soporta grabación de audio. Por favor usa Chrome, Edge o Firefox.');
+if (!navigator.mediaDevices) {
+    alert('Tu navegador no soporta grabacion de audio. Por favor usa Chrome, Edge o Firefox.');
 }
 
-const AUDIO_PROFILE_CONFIG = {
-    stable: {
-        pcmRate: 12000,
-        baseLead: IS_MOBILE_DEVICE ? 0.28 : 0.20,
-        minLead: IS_MOBILE_DEVICE ? 0.24 : 0.16,
-        maxLead: IS_MOBILE_DEVICE ? 0.50 : 0.35,
-        maxQueue: IS_MOBILE_DEVICE ? 1.10 : 0.85,
-        queueTrim: IS_MOBILE_DEVICE ? 0.06 : 0.04
-    },
-    balanced: {
-        pcmRate: 16000,
-        baseLead: LIVE_PLAYBACK_LEAD_SECONDS,
-        minLead: ADAPTIVE_LEAD_MIN_SECONDS,
-        maxLead: ADAPTIVE_LEAD_MAX_SECONDS,
-        maxQueue: MAX_PLAYBACK_QUEUE_SECONDS,
-        queueTrim: PLAYBACK_QUEUE_TRIM_SECONDS
-    },
-    'low-latency': {
-        pcmRate: 16000,
-        baseLead: IS_MOBILE_DEVICE ? 0.18 : 0.10,
-        minLead: IS_MOBILE_DEVICE ? 0.15 : 0.08,
-        maxLead: IS_MOBILE_DEVICE ? 0.30 : 0.20,
-        maxQueue: IS_MOBILE_DEVICE ? 0.70 : 0.50,
-        queueTrim: IS_MOBILE_DEVICE ? 0.10 : 0.07
-    }
-};
-
-function formatMetricMs(valueSeconds) {
-    if (valueSeconds === null || valueSeconds === undefined || Number.isNaN(valueSeconds)) return '--';
-    return `${Math.round(valueSeconds * 1000)}ms`;
-}
-
-function updateAudioStats(force = false) {
+function updateAudioStats() {
     if (!audioStats) return;
-    const now = performance.now();
-    if (!force && (now - lastStatsUpdateMs) < 500) return;
-    lastStatsUpdateMs = now;
-
-    const jitter = formatMetricMs(playbackInterArrivalJitter);
-    const queue = formatMetricMs(lastPlaybackQueueSeconds);
-    const lead = formatMetricMs(lastAdaptiveLeadSeconds);
     const rtt = lastRttMs === null ? '--' : `${Math.round(lastRttMs)}ms`;
-    audioStats.textContent = `Perfil: ${currentAudioProfile} | RTT: ${rtt} | Jitter: ${jitter} | Cola: ${queue} | Lead: ${lead}`;
+    const peers = rtcPeers.size;
+    const connected = Array.from(rtcPeers.values())
+        .filter(pc => pc.connectionState === 'connected').length;
+    audioStats.textContent = `WebRTC | RTT: ${rtt} | Peers: ${connected}/${peers}`;
 }
 
-function applyAudioProfile(profileName) {
-    const profile = AUDIO_PROFILE_CONFIG[profileName] || AUDIO_PROFILE_CONFIG.balanced;
-    currentAudioProfile = AUDIO_PROFILE_CONFIG[profileName] ? profileName : 'balanced';
+// ========== WEBRTC (AUDIO EN TIEMPO REAL) ==========
 
-    runtimePcmRate = profile.pcmRate;
-    runtimeBaseLeadSeconds = profile.baseLead;
-    runtimeMinLeadSeconds = profile.minLead;
-    runtimeMaxLeadSeconds = profile.maxLead;
-    runtimeMaxQueueSeconds = profile.maxQueue;
-    runtimeQueueTrimSeconds = profile.queueTrim;
-
-    if (audioProfileSelect) {
-        audioProfileSelect.value = currentAudioProfile;
+function createPeerConnection(targetUserId) {
+    if (rtcPeers.has(targetUserId)) {
+        closePeerConnection(targetUserId);
     }
-    localStorage.setItem('audio_profile', currentAudioProfile);
-    updateAudioStats(true);
+
+    const pc = new RTCPeerConnection(RTC_CONFIG);
+
+    pc.onicecandidate = (event) => {
+        if (event.candidate && socket && socket.connected) {
+            socket.emit('ice-candidate', {
+                targetUserId,
+                candidate: event.candidate
+            });
+        }
+    };
+
+    pc.ontrack = (event) => {
+        const [remoteStream] = event.streams;
+        if (!remoteStream) return;
+
+        let audioEl = rtcRemoteAudioEls.get(targetUserId);
+        if (!audioEl) {
+            audioEl = new Audio();
+            audioEl.autoplay = true;
+            rtcRemoteAudioEls.set(targetUserId, audioEl);
+        }
+        audioEl.srcObject = remoteStream;
+        audioEl.play().catch(() => {});
+    };
+
+    pc.onconnectionstatechange = () => {
+        const state = pc.connectionState || pc.iceConnectionState;
+        console.log(`[WebRTC] ${targetUserId}: ${state}`);
+        updateAudioStats();
+        if (state === 'failed' || state === 'closed') {
+            closePeerConnection(targetUserId);
+        }
+    };
+
+    rtcPeers.set(targetUserId, pc);
+    return pc;
+}
+
+function closePeerConnection(userId) {
+    const pc = rtcPeers.get(userId);
+    if (pc) {
+        pc.onicecandidate = null;
+        pc.ontrack = null;
+        pc.onconnectionstatechange = null;
+        pc.close();
+        rtcPeers.delete(userId);
+    }
+    const audioEl = rtcRemoteAudioEls.get(userId);
+    if (audioEl) {
+        audioEl.srcObject = null;
+        rtcRemoteAudioEls.delete(userId);
+    }
+}
+
+function closeAllPeerConnections() {
+    for (const userId of Array.from(rtcPeers.keys())) {
+        closePeerConnection(userId);
+    }
+}
+
+async function ensureMicStream() {
+    if (currentStream) {
+        const tracks = currentStream.getAudioTracks();
+        if (tracks.length > 0 && tracks[0].readyState === 'live') {
+            return currentStream;
+        }
+    }
+    currentStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+        }
+    });
+    // Empieza muteado; PTT lo desmutea.
+    currentStream.getAudioTracks().forEach(t => { t.enabled = false; });
+    return currentStream;
+}
+
+function setMicEnabled(enabled) {
+    if (!currentStream) return;
+    currentStream.getAudioTracks().forEach(t => { t.enabled = enabled; });
+}
+
+async function connectWebRTC(targetUserId) {
+    if (!socket || !socket.connected) return;
+    if (rtcPeers.has(targetUserId)) {
+        const existing = rtcPeers.get(targetUserId);
+        if (existing.connectionState === 'connected' || existing.connectionState === 'connecting') {
+            return;
+        }
+        closePeerConnection(targetUserId);
+    }
+
+    const stream = await ensureMicStream();
+    const pc = createPeerConnection(targetUserId);
+
+    stream.getAudioTracks().forEach(track => {
+        pc.addTrack(track, stream);
+    });
+
+    const offer = await pc.createOffer({ offerToReceiveAudio: true });
+    await pc.setLocalDescription(offer);
+    socket.emit('p2p-offer', { targetUserId, offer });
+    console.log(`[WebRTC] Offer sent to ${targetUserId}`);
+}
+
+async function handleIncomingOffer(fromUserId, offer) {
+    if (!socket || !socket.connected) return;
+
+    const stream = await ensureMicStream();
+    let pc = rtcPeers.get(fromUserId);
+    if (!pc) {
+        pc = createPeerConnection(fromUserId);
+        stream.getAudioTracks().forEach(track => {
+            pc.addTrack(track, stream);
+        });
+    }
+
+    await pc.setRemoteDescription(new RTCSessionDescription(offer));
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    socket.emit('p2p-answer', { targetUserId: fromUserId, answer });
+    console.log(`[WebRTC] Answer sent to ${fromUserId}`);
+}
+
+async function handleIncomingAnswer(fromUserId, answer) {
+    const pc = rtcPeers.get(fromUserId);
+    if (!pc) return;
+    await pc.setRemoteDescription(new RTCSessionDescription(answer));
+    console.log(`[WebRTC] Answer received from ${fromUserId}`);
+}
+
+async function handleIceCandidate(fromUserId, candidate) {
+    const pc = rtcPeers.get(fromUserId);
+    if (!pc) return;
+    await pc.addIceCandidate(new RTCIceCandidate(candidate));
+}
+
+async function connectWebRTCToSelectedContacts() {
+    for (const userId of selectedContacts) {
+        try {
+            await connectWebRTC(userId);
+        } catch (err) {
+            console.error(`[WebRTC] Error conectando con ${userId}:`, err);
+        }
+    }
 }
 
 function startPingHeartbeat() {
@@ -207,14 +284,10 @@ function connectToServer() {
             console.log('Desconectado del servidor');
             updateConnectionStatus('disconnected');
             pttButton.disabled = true;
-            playbackNextTime = 0;
-            playbackLastArrivalTime = 0;
-            playbackInterArrivalJitter = 0;
-            lastPlaybackQueueSeconds = 0;
-            lastAdaptiveLeadSeconds = runtimeBaseLeadSeconds;
             lastRttMs = null;
             stopPingHeartbeat();
-            updateAudioStats(true);
+            closeAllPeerConnections();
+            updateAudioStats();
         });
 
         socket.on('connect_error', (error) => {
@@ -268,36 +341,43 @@ function connectToServer() {
             updateUserTalking(data.userId, data.isTalking);
         });
 
+        // El audio en vivo va por WebRTC, no por audio-broadcast.
+        // audio-broadcast solo se usa para clips de historial (mode: 'full').
         socket.on('audio-broadcast', (data) => {
-            if (data.mode === 'pcm-live') {
-                if (data.transmissionId) {
-                    liveTransmissionsReceived.add(data.transmissionId);
-                }
-                playPcmChunk(data.audioData, data.sampleRate || LIVE_PCM_RATE, data.transmissionId);
-                return;
-            }
-
-            if (data.mode === 'live') {
-                if (data.transmissionId) {
-                    liveTransmissionsReceived.add(data.transmissionId);
-                }
-                enqueueLiveAudio(data.audioData, data.mimeType);
-                return;
-            }
-
             if (data.mode === 'full') {
                 addHistoryMessage('audio', { user: data.userId, audioData: data.audioData, mimeType: data.mimeType });
-                const hadLive = data.transmissionId && liveTransmissionsReceived.has(data.transmissionId);
-                if (!hadLive) {
-                    playAudioClip(data.audioData, data.mimeType);
-                } else if (data.transmissionId) {
-                    liveTransmissionsReceived.delete(data.transmissionId);
-                }
-                return;
             }
+        });
 
-            enqueueLiveAudio(data.audioData, data.mimeType);
-            addHistoryMessage('audio', { user: data.userId, audioData: data.audioData, mimeType: data.mimeType });
+        // Senalizacion WebRTC
+        socket.on('p2p-offer', async (data) => {
+            const { from, offer } = data || {};
+            if (!from || !offer) return;
+            try {
+                await handleIncomingOffer(from, offer);
+            } catch (err) {
+                console.error('[WebRTC] Error procesando offer:', err);
+            }
+        });
+
+        socket.on('p2p-answer', async (data) => {
+            const { from, answer } = data || {};
+            if (!from || !answer) return;
+            try {
+                await handleIncomingAnswer(from, answer);
+            } catch (err) {
+                console.error('[WebRTC] Error procesando answer:', err);
+            }
+        });
+
+        socket.on('ice-candidate', async (data) => {
+            const { from, candidate } = data || {};
+            if (!from || !candidate) return;
+            try {
+                await handleIceCandidate(from, candidate);
+            } catch (err) {
+                console.error('[WebRTC] Error con ICE candidate:', err);
+            }
         });
 
     } catch (error) {
@@ -460,10 +540,15 @@ function selectContact(contactName, contactElement) {
         selectedContacts.delete(contactName);
         contactElement.classList.remove('selected');
         contactElement.querySelector('.selected-indicator').style.display = 'none';
+        closePeerConnection(contactName);
     } else {
         selectedContacts.add(contactName);
         contactElement.classList.add('selected');
         contactElement.querySelector('.selected-indicator').style.display = 'inline';
+        // Pre-conectar WebRTC inmediatamente para que el PTT sea instantaneo.
+        connectWebRTC(contactName).catch(err => {
+            console.error(`[WebRTC] Error pre-conectando con ${contactName}:`, err);
+        });
     }
 
     updatePttButtonState();
@@ -537,25 +622,63 @@ async function startRecording() {
     }
 
     try {
-        currentStream = await navigator.mediaDevices.getUserMedia({
-            audio: {
-                channelCount: 1,
-                sampleRate: runtimePcmRate,
-                // Mejor calidad para PTT; evita compresion/agresividad del micro.
-                echoCancellation: false,
-                noiseSuppression: false,
-                autoGainControl: false
-            }
-        });
-
-        recordingPcmChunks = [];
-        recordingSampleRate = runtimePcmRate;
-        currentTransmissionId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        await ensureMicStream();
         isRecording = true;
 
-        startPcmLiveCapture(currentStream, currentTransmissionId);
+        // Desmutear el track de audio: el audio empieza a fluir por WebRTC al instante.
+        setMicEnabled(true);
 
-        // Notificar que estas hablando
+        // Iniciar MediaRecorder en paralelo solo para guardar historial al soltar.
+        mediaRecorderChunks = [];
+        const preferredTypes = [
+            'audio/webm;codecs=opus',
+            'audio/webm',
+            'audio/ogg;codecs=opus',
+            'audio/ogg'
+        ];
+        mediaRecorderMimeType = 'audio/webm';
+        for (const t of preferredTypes) {
+            if (MediaRecorder.isTypeSupported(t)) {
+                mediaRecorderMimeType = t;
+                break;
+            }
+        }
+        try {
+            mediaRecorder = new MediaRecorder(currentStream, { mimeType: mediaRecorderMimeType });
+            mediaRecorder.ondataavailable = (event) => {
+                if (event.data && event.data.size > 0) {
+                    mediaRecorderChunks.push(event.data);
+                }
+            };
+            mediaRecorder.onstop = async () => {
+                try {
+                    if (mediaRecorderChunks.length === 0) return;
+                    const blob = new Blob(mediaRecorderChunks, { type: mediaRecorderMimeType });
+                    const base64Audio = await blobToBase64(blob);
+                    addHistoryMessage('audio', { user: currentUser, audioData: base64Audio, mimeType: mediaRecorderMimeType });
+
+                    // Enviar clip completo para historial del otro usuario.
+                    const targetUsers = Array.from(selectedContacts);
+                    if (socket && socket.connected && targetUsers.length > 0) {
+                        socket.emit('audio-stream', {
+                            channel: currentChannel,
+                            targetUsers,
+                            audioData: base64Audio,
+                            mode: 'full',
+                            mimeType: mediaRecorderMimeType
+                        });
+                    }
+                } catch (err) {
+                    console.error('Error generando historial:', err);
+                } finally {
+                    mediaRecorderChunks = [];
+                }
+            };
+            mediaRecorder.start();
+        } catch (recErr) {
+            console.warn('MediaRecorder no disponible para historial:', recErr);
+        }
+
         socket.emit('voice-activity', {
             channel: currentChannel,
             isTalking: true
@@ -566,73 +689,39 @@ async function startRecording() {
     }
 }
 
-/**
- * Detener grabacion
- */
 function stopRecording() {
     if (!isRecording) return;
-
-    const transmissionId = currentTransmissionId;
     isRecording = false;
-    currentTransmissionId = null;
 
-    stopPcmLiveCapture();
-    finalizeCurrentRecording(transmissionId);
-    closeCurrentStream();
+    // Mutear el track: corta el audio en WebRTC al instante.
+    setMicEnabled(false);
 
-    // Notificar que dejaste de hablar
+    // Parar MediaRecorder para generar el clip del historial.
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+        try {
+            mediaRecorder.stop();
+        } catch (err) {
+            console.error('Error al detener MediaRecorder:', err);
+        }
+    }
+
     socket.emit('voice-activity', {
         channel: currentChannel,
         isTalking: false
     });
 }
 
-/**
- * Cierra stream de captura actual
- */
+// No cerramos el stream aqui; se mantiene vivo para WebRTC.
+// Solo se cierra al desconectarse del servidor.
 function closeCurrentStream() {
-    if (!currentStream) return;
-    currentStream.getTracks().forEach(track => track.stop());
-    currentStream = null;
 }
 
 /**
  * Genera audio final WAV para historial
  */
 function finalizeCurrentRecording(transmissionId) {
-    const chunks = recordingPcmChunks.slice();
-    recordingPcmChunks = [];
-    if (chunks.length === 0) return;
-
-    try {
-        let pcm16 = concatInt16Chunks(chunks);
-        let wavRate = recordingSampleRate || LIVE_PCM_RATE;
-
-        if (wavRate > HISTORY_WAV_MAX_RATE) {
-            pcm16 = downsampleInt16Buffer(pcm16, wavRate, HISTORY_WAV_MAX_RATE);
-            wavRate = HISTORY_WAV_MAX_RATE;
-        }
-
-        const wavBuffer = pcm16ToWavBuffer(pcm16, wavRate);
-        const base64Audio = arrayBufferToBase64(wavBuffer);
-        const mimeType = 'audio/wav';
-
-        const targetUsers = Array.from(selectedContacts);
-        if (socket && socket.connected && targetUsers.length > 0) {
-            socket.emit('audio-stream', {
-                channel: currentChannel,
-                targetUsers,
-                audioData: base64Audio,
-                mode: 'full',
-                transmissionId,
-                mimeType
-            });
-        }
-
-        addHistoryMessage('audio', { user: currentUser, audioData: base64Audio, mimeType });
-    } catch (err) {
-        console.error('Error al procesar audio final:', err);
-    }
+    // Mantener la firma por compatibilidad, pero el historial ahora se genera
+    // desde MediaRecorder.onstop usando blobs (ver startRecording).
 }
 /**
  * Inicia captura PCM en vivo para baja latencia.
@@ -663,23 +752,41 @@ function startPcmLiveCapture(stream, transmissionId) {
             recordingSampleRate = captureAudioContext.sampleRate || LIVE_PCM_RATE;
             recordingPcmChunks.push(float32ToInt16(input));
 
+            // Si el modo PCM en vivo esta desactivado, solo acumulamos para historial.
+            if (!ENABLE_PCM_LIVE_STREAMING) {
+                return;
+            }
+
             const downsampled = downsampleBuffer(input, captureAudioContext.sampleRate, runtimePcmRate);
             if (!downsampled || downsampled.length === 0) return;
+
+            const pcm16 = float32ToInt16(downsampled);
+            // Agrupar varios bloques para reducir overhead y ser menos sensible al jitter.
+            pcmSendBuffer.push(pcm16);
+            pcmSendBufferSamples += pcm16.length;
+            const targetSamples = Math.round(runtimePcmRate * (PCM_TARGET_PACKET_MS / 1000));
+            if (pcmSendBufferSamples < targetSamples) {
+                return;
+            }
 
             // En tiempo real no conviene saltar frames: evita huecos por descarte.
             const now = Date.now();
             if (SEND_THROTTLE_MS > 0 && (now - lastSendTime) < SEND_THROTTLE_MS) {
-                return; // Skip este frame, enviar en el próximo
+                // Dejamos acumulado el buffer y enviaremos en el siguiente callback.
+                return;
             }
             lastSendTime = now;
 
-            const pcm16 = float32ToInt16(downsampled);
+            const combined = concatInt16Chunks(pcmSendBuffer);
+            pcmSendBuffer = [];
+            pcmSendBufferSamples = 0;
+
             // Sin compresión para menor overhead; sin volatile para evitar recortes de paquetes.
             const targetUsers = Array.from(selectedContacts);
             socket.compress(false).emit('audio-stream', {
                 channel: currentChannel,
                 targetUsers,
-                audioData: pcm16.buffer,
+                audioData: combined.buffer,
                 mode: 'pcm-live',
                 format: 'pcm16',
                 sampleRate: runtimePcmRate,
@@ -719,6 +826,8 @@ function stopPcmLiveCapture() {
         captureSourceNode = null;
         captureSilenceGainNode = null;
         captureAudioContext = null;
+        pcmSendBuffer = [];
+        pcmSendBufferSamples = 0;
     }
 }
 
@@ -830,6 +939,23 @@ function arrayBufferToBase64(buffer) {
     return btoa(binary);
 }
 
+function blobToBase64(blob) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onloadend = () => {
+            const result = reader.result;
+            if (typeof result === 'string') {
+                const commaIndex = result.indexOf(',');
+                resolve(commaIndex >= 0 ? result.slice(commaIndex + 1) : result);
+            } else {
+                resolve('');
+            }
+        };
+        reader.onerror = reject;
+        reader.readAsDataURL(blob);
+    });
+}
+
 function base64ToInt16(base64Data) {
     const binary = atob(base64Data);
     const bytes = new Uint8Array(binary.length);
@@ -880,7 +1006,7 @@ function getAdaptivePlaybackLead(now, chunkDuration) {
         const interArrival = now - playbackLastArrivalTime;
         const expected = Math.max(0.001, chunkDuration || 0.04);
         const delta = Math.abs(interArrival - expected);
-        playbackInterArrivalJitter = (playbackInterArrivalJitter * 0.9) + (delta * 0.1);
+        playbackInterArrivalJitter = (playbackInterArrivalJitter * 0.95) + (delta * 0.05);
     }
     playbackLastArrivalTime = now;
 
@@ -923,8 +1049,10 @@ function playPcmChunk(base64Pcm, sampleRate, transmissionId) {
         const currentQueue = playbackNextTime - now;
         lastPlaybackQueueSeconds = currentQueue;
         if (currentQueue > runtimeMaxQueueSeconds) {
-            // Evita saltos bruscos: recorta de forma gradual el exceso de cola.
-            playbackNextTime = Math.max(minStart, playbackNextTime - runtimeQueueTrimSeconds);
+            // Evita saltos bruscos: recorta de forma gradual y proporcional el exceso de cola.
+            const excess = currentQueue - runtimeMaxQueueSeconds;
+            const trimAmount = Math.min(excess * 0.5, runtimeQueueTrimSeconds);
+            playbackNextTime = Math.max(minStart, playbackNextTime - trimAmount);
         }
 
         const startAt = playbackNextTime;
@@ -940,6 +1068,16 @@ function playPcmChunk(base64Pcm, sampleRate, transmissionId) {
         source.start(startAt);
         playbackNextTime = startAt + buffer.duration;
         updateAudioStats();
+        // Diagnostico ligero en consola cada cierto numero de chunks.
+        debugPcmChunkCounter++;
+        if (debugPcmChunkCounter % 25 === 0) {
+            console.debug(
+                '[AudioLive] jitter=%sms, cola=%sms, lead=%sms',
+                Math.round((playbackInterArrivalJitter || 0) * 1000),
+                Math.round((lastPlaybackQueueSeconds || 0) * 1000),
+                Math.round((lastAdaptiveLeadSeconds || 0) * 1000)
+            );
+        }
     } catch (err) {
         console.error('Error reproduciendo chunk PCM:', err);
     }
@@ -975,7 +1113,7 @@ function playAudioClip(audioData, mimeType = 'audio/webm', onDone) {
 }
 
 /**
- * Cola de reproducción para chunks en vivo.
+ * Cola de reproducción para chunks en vivo (usado por modo 'full' legacy).
  */
 function enqueueLiveAudio(audioData, mimeType = 'audio/webm') {
     liveAudioQueue.push({ audioData, mimeType });
@@ -996,6 +1134,111 @@ function playNextLiveAudio() {
 }
 
 /**
+ * MediaSource Extensions: reproduce WebM en vivo mientras llegan chunks.
+ * Los fragmentos de MediaRecorder no son archivos independientes; hay que
+ * concatenarlos en un stream y reproducir con MSE.
+ */
+function appendLiveChunkMSE(base64Audio, mimeType, transmissionId) {
+    if (!window.MediaSource) {
+        enqueueLiveAudio(base64Audio, mimeType);
+        return;
+    }
+    if (!base64Audio || typeof base64Audio !== 'string') return;
+
+    const mime = mimeType || 'audio/webm';
+    const buffer = base64ToArrayBuffer(base64Audio);
+    if (!buffer || buffer.byteLength === 0) return;
+
+    const isNewTransmission = transmissionId && transmissionId !== liveTransmissionId;
+    const needReinit = !liveMediaSource || liveMediaSource.readyState === 'ended' || isNewTransmission;
+
+    if (needReinit && liveMediaSource) {
+        clearLiveMSE();
+    }
+
+    liveTransmissionId = transmissionId || liveTransmissionId;
+    liveMSEChunkQueue.push(buffer);
+
+    const tryAppendQueued = () => {
+        if (liveMSEChunkQueue.length === 0 || !liveSourceBuffer || liveSourceBuffer.updating) return;
+        const buf = liveMSEChunkQueue.shift();
+        try {
+            liveSourceBuffer.appendBuffer(buf);
+        } catch (e) {
+            console.error('Error appendBuffer:', e);
+        }
+    };
+
+    if (!liveMediaSource) {
+        liveMediaSource = new MediaSource();
+        liveAudioEl = document.createElement('audio');
+        liveAudioEl.autoplay = true;
+        document.body.appendChild(liveAudioEl);
+
+        liveMediaSource.addEventListener('sourceopen', () => {
+            try {
+                liveSourceBuffer = liveMediaSource.addSourceBuffer(mime);
+                liveSourceBuffer.addEventListener('updateend', tryAppendQueued);
+                tryAppendQueued();
+            } catch (e) {
+                console.error('Error creando SourceBuffer:', e);
+            }
+        });
+
+        liveAudioEl.src = URL.createObjectURL(liveMediaSource);
+        liveAudioEl.play().catch((e) => console.warn('Live audio play:', e));
+    } else if (liveSourceBuffer && !liveSourceBuffer.updating) {
+        tryAppendQueued();
+    }
+
+    if (liveMSEEndTimeout) clearTimeout(liveMSEEndTimeout);
+    liveMSEEndTimeout = setTimeout(() => {
+        if (liveMediaSource && liveMediaSource.readyState === 'open') {
+            try {
+                liveMediaSource.endOfStream();
+            } catch (e) {}
+        }
+        liveMSEEndTimeout = null;
+    }, 600);
+}
+
+function base64ToArrayBuffer(base64) {
+    let binary = '';
+    try {
+        binary = atob(base64);
+    } catch (e) {
+        return null;
+    }
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes.buffer;
+}
+
+function clearLiveMSE() {
+    if (liveMSEEndTimeout) {
+        clearTimeout(liveMSEEndTimeout);
+        liveMSEEndTimeout = null;
+    }
+    liveMSEChunkQueue = [];
+    if (liveAudioEl && liveAudioEl.src) {
+        URL.revokeObjectURL(liveAudioEl.src);
+        liveAudioEl.src = '';
+        liveAudioEl.remove();
+    }
+    liveAudioEl = null;
+    liveSourceBuffer = null;
+    if (liveMediaSource) {
+        try {
+            if (liveMediaSource.readyState === 'open') liveMediaSource.endOfStream();
+        } catch (e) {}
+        liveMediaSource = null;
+    }
+    liveTransmissionId = null;
+}
+
+/**
  * Reproducir audio desde historial
  */
 function playAudio(audioData, mimeType) {
@@ -1009,11 +1252,7 @@ connectBtn.addEventListener('click', connectToServer);
 if (registerBtn) {
     registerBtn.addEventListener('click', registerUser);
 }
-if (audioProfileSelect) {
-    audioProfileSelect.addEventListener('change', () => {
-        applyAudioProfile(audioProfileSelect.value);
-    });
-}
+// Perfiles de audio ya no aplican (WebRTC maneja su propio codec).
 
 // Permitir Enter en el input
 usernameInput.addEventListener('keypress', (e) => {
@@ -1027,6 +1266,11 @@ if (passwordInput) {
 
 // Botón desconectar
 disconnectBtn.addEventListener('click', () => {
+    closeAllPeerConnections();
+    if (currentStream) {
+        currentStream.getTracks().forEach(t => t.stop());
+        currentStream = null;
+    }
     if (socket) {
         socket.disconnect();
         authPanel.style.display = 'block';
@@ -1114,10 +1358,9 @@ createChannelBtn.addEventListener('click', () => {
 // Prevenir que el botón PTT pierda el foco
 pttButton.addEventListener('contextmenu', (e) => e.preventDefault());
 
-applyAudioProfile(localStorage.getItem('audio_profile') || 'balanced');
-updateAudioStats(true);
+updateAudioStats();
 
-console.log(' App lista para usar!');
+console.log('App lista para usar (WebRTC)');
 
 
 
