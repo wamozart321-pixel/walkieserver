@@ -5,6 +5,18 @@ const fs = require('fs');
 const { Server } = require('socket.io');
 const path = require('path');
 require('dotenv').config();
+const {
+  buildAppUsers,
+  isValidUserIdFormat,
+  isValidPasswordFormat,
+  isValidAppUser,
+  resolveTargetUsers,
+  buildAudioPayload,
+  getUsersInChannel,
+  moveSocketToChannel,
+  removeSocketFromChannel,
+  findSocketIdByUserId
+} = require('./core');
 
 const app = express();
 
@@ -57,27 +69,6 @@ const APP_USERS_RAW = process.env.APP_USERS || '';
 const userStoreDir = path.join(__dirname, '../data');
 const userStoreFile = path.join(userStoreDir, 'app-users.json');
 
-function buildAppUsers(rawValue) {
-  const appUsers = new Map();
-  if (!rawValue || typeof rawValue !== 'string') return appUsers;
-
-  for (const item of rawValue.split(',')) {
-    const pair = item.trim();
-    if (!pair) continue;
-
-    const separatorIndex = pair.indexOf(':');
-    if (separatorIndex <= 0) continue;
-
-    const username = pair.slice(0, separatorIndex).trim();
-    const password = pair.slice(separatorIndex + 1).trim();
-    if (!username || !password) continue;
-
-    appUsers.set(username, password);
-  }
-
-  return appUsers;
-}
-
 const appUsers = buildAppUsers(APP_USERS_RAW);
 const runtimeAppUsers = new Map(appUsers);
 
@@ -108,20 +99,6 @@ function persistUsers() {
   } catch (err) {
     console.error('No se pudo guardar data/app-users.json:', err.message);
   }
-}
-
-function isValidAppUser(userId, password) {
-  // Admin tambien puede entrar a la app como respaldo.
-  if (userId === AUTH_USER && password === AUTH_PASS) return true;
-  return runtimeAppUsers.has(userId) && runtimeAppUsers.get(userId) === password;
-}
-
-function isValidUserIdFormat(userId) {
-  return /^[a-zA-Z0-9_.-]{3,20}$/.test(userId);
-}
-
-function isValidPasswordFormat(password) {
-  return typeof password === 'string' && password.length >= 4 && password.length <= 80;
 }
 
 loadPersistedUsers();
@@ -182,7 +159,7 @@ io.on('connection', (socket) => {
     }
 
     if (!existingAuthUser) {
-      if (!isValidAppUser(requestedUserId, String(password))) {
+      if (!isValidAppUser(requestedUserId, String(password), AUTH_USER, AUTH_PASS, runtimeAppUsers)) {
         socket.emit('auth-error', { message: 'Usuario o clave incorrectos.' });
         return;
       }
@@ -194,19 +171,11 @@ io.on('connection', (socket) => {
 
     const authUserId = authenticatedSockets.get(socket.id);
 
-    if (users.has(socket.id)) {
-      const oldChannel = users.get(socket.id).channel;
-      channels.get(oldChannel)?.delete(socket.id);
-      socket.leave(oldChannel);
+    const movement = moveSocketToChannel(users, channels, socket.id, authUserId, requestedChannel);
+    if (movement.previousChannel) {
+      socket.leave(movement.previousChannel);
     }
-
-    users.set(socket.id, { userId: authUserId, channel: requestedChannel });
     socket.join(requestedChannel);
-
-    if (!channels.has(requestedChannel)) {
-      channels.set(requestedChannel, new Set());
-    }
-    channels.get(requestedChannel).add(socket.id);
 
     console.log(`${authUserId} se unio al canal ${requestedChannel}`);
 
@@ -215,9 +184,7 @@ io.on('connection', (socket) => {
       channel: requestedChannel
     });
 
-    const usersInChannel = Array.from(channels.get(requestedChannel))
-      .map((id) => users.get(id)?.userId)
-      .filter(Boolean);
+    const usersInChannel = getUsersInChannel(channels, users, requestedChannel);
 
     io.to(requestedChannel).emit('channel-users', usersInChannel);
     socket.emit('join-success', { userId: authUserId, channel: requestedChannel });
@@ -229,19 +196,12 @@ io.on('connection', (socket) => {
 
     if (!user || !channel || !audioData) return;
 
-    const payload = {
-      userId: user.userId,
-      audioData,
-      mode: mode || 'full',
-      transmissionId: transmissionId || null,
-      mimeType: mimeType || 'audio/webm',
-      format: mode === 'pcm-live' ? (format || 'pcm16') : (format || null),
-      sampleRate: mode === 'pcm-live' ? (sampleRate || 16000) : (sampleRate || null)
-    };
+    const payload = buildAudioPayload(
+      { audioData, mode, transmissionId, mimeType, format, sampleRate },
+      user.userId
+    );
 
-    const resolvedTargets = Array.isArray(targetUsers)
-      ? targetUsers.filter((u) => typeof u === 'string' && u.trim() !== '')
-      : (targetUser ? [targetUser] : []);
+    const resolvedTargets = resolveTargetUsers(targetUsers, targetUser);
 
     if (resolvedTargets.length > 0) {
       const uniqueTargets = new Set(resolvedTargets);
@@ -258,40 +218,34 @@ io.on('connection', (socket) => {
 
   socket.on('p2p-offer', (data) => {
     const { targetUserId, offer } = data || {};
-    for (const [socketId, user] of users.entries()) {
-      if (user.userId === targetUserId) {
-        io.to(socketId).emit('p2p-offer', {
-          from: users.get(socket.id)?.userId,
-          offer
-        });
-        break;
-      }
+    const targetSocketId = findSocketIdByUserId(users, targetUserId);
+    if (targetSocketId) {
+      io.to(targetSocketId).emit('p2p-offer', {
+        from: users.get(socket.id)?.userId,
+        offer
+      });
     }
   });
 
   socket.on('p2p-answer', (data) => {
     const { targetUserId, answer } = data || {};
-    for (const [socketId, user] of users.entries()) {
-      if (user.userId === targetUserId) {
-        io.to(socketId).emit('p2p-answer', {
-          from: users.get(socket.id)?.userId,
-          answer
-        });
-        break;
-      }
+    const targetSocketId = findSocketIdByUserId(users, targetUserId);
+    if (targetSocketId) {
+      io.to(targetSocketId).emit('p2p-answer', {
+        from: users.get(socket.id)?.userId,
+        answer
+      });
     }
   });
 
   socket.on('ice-candidate', (data) => {
     const { targetUserId, candidate } = data || {};
-    for (const [socketId, user] of users.entries()) {
-      if (user.userId === targetUserId) {
-        io.to(socketId).emit('ice-candidate', {
-          from: users.get(socket.id)?.userId,
-          candidate
-        });
-        break;
-      }
+    const targetSocketId = findSocketIdByUserId(users, targetUserId);
+    if (targetSocketId) {
+      io.to(targetSocketId).emit('ice-candidate', {
+        from: users.get(socket.id)?.userId,
+        candidate
+      });
     }
   });
 
@@ -308,28 +262,17 @@ io.on('connection', (socket) => {
   });
 
   socket.on('disconnect', () => {
-    const user = users.get(socket.id);
-
-    if (user) {
-      const { userId, channel } = user;
-
-      channels.get(channel)?.delete(socket.id);
-      if (channels.get(channel)?.size === 0) {
-        channels.delete(channel);
-      }
-
+    const removed = removeSocketFromChannel(users, channels, socket.id);
+    if (removed) {
+      const { userId, channel } = removed;
       socket.to(channel).emit('user-left', {
         userId,
         channel
       });
 
-      const usersInChannel = Array.from(channels.get(channel) || [])
-        .map((id) => users.get(id)?.userId)
-        .filter(Boolean);
+      const usersInChannel = getUsersInChannel(channels, users, channel);
 
       io.to(channel).emit('channel-users', usersInChannel);
-
-      users.delete(socket.id);
       console.log(`${userId} se desconecto del canal ${channel}`);
     }
 
