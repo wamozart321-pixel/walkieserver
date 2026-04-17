@@ -445,6 +445,51 @@ input[type="password"]:focus {
     font-weight: 700;
 }
 
+.user-item .conn-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.18);
+    box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35) inset;
+    flex-shrink: 0;
+    transition: background 0.2s ease, box-shadow 0.2s ease;
+}
+
+.user-item.conn-connecting .conn-dot {
+    background: var(--warning-400);
+    box-shadow: 0 0 8px rgba(241, 191, 72, 0.65);
+    animation: pulseDot 1s ease-in-out infinite;
+}
+
+.user-item.conn-ready .conn-dot {
+    background: var(--green-400);
+    box-shadow: 0 0 10px rgba(69, 210, 139, 0.75);
+}
+
+.user-item.conn-failed .conn-dot {
+    background: var(--red-400);
+    box-shadow: 0 0 10px rgba(255, 108, 87, 0.7);
+}
+
+.user-item .conn-label {
+    font-size: 0.72rem;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    text-transform: uppercase;
+}
+
+.user-item.conn-ready .conn-label {
+    color: var(--green-400);
+}
+
+.user-item.conn-connecting .conn-label {
+    color: var(--warning-400);
+}
+
+.user-item.conn-failed .conn-label {
+    color: var(--red-400);
+}
+
 .ptt-section {
     display: grid;
     gap: 12px;

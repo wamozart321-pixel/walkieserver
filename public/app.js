@@ -26,7 +26,10 @@ const RTC_CONFIG = {
     iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' }
-    ]
+    ],
+    // Pre-gather candidatos ICE antes incluso de crear la oferta:
+    // reduce de forma muy notable el tiempo hasta connectionState='connected'.
+    iceCandidatePoolSize: 10
 };
 const rtcPeers = new Map();
 const rtcRemoteAudioEls = new Map();
@@ -101,6 +104,7 @@ async function deriveSharedKeyFrom(fromUserId, publicKeyB64) {
         );
         e2eSharedKeys.set(fromUserId, sharedKey);
         console.log(`[E2E] Clave compartida derivada con ${fromUserId}`);
+        updateAudioStats();
 
         // Reciprocidad: si todavia no enviamos la nuestra, hazlo.
         if (!e2eKeyExchangeSent.has(fromUserId)) {
@@ -187,12 +191,14 @@ function attachDataChannel(targetUserId, dc) {
     dc.onopen = () => {
         console.log(`[WebRTC] DataChannel '${dc.label}' abierto con ${targetUserId}`);
         updateAudioStats();
+        refreshConnLabels();
     };
     dc.onclose = () => {
         if (rtcDataChannels.get(targetUserId) === dc) {
             rtcDataChannels.delete(targetUserId);
         }
         updateAudioStats();
+        refreshConnLabels();
     };
     dc.onerror = (e) => {
         console.warn(`[WebRTC] DataChannel error con ${targetUserId}:`, e);
@@ -240,6 +246,7 @@ function createPeerConnection(targetUserId, isInitiator = false) {
         const state = pc.connectionState || pc.iceConnectionState;
         console.log(`[WebRTC] ${targetUserId}: ${state}`);
         updateAudioStats();
+        refreshConnLabels();
         if (state === 'failed' || state === 'closed') {
             const stillSelected = selectedContacts.has(targetUserId);
             closePeerConnection(targetUserId);
@@ -826,6 +833,56 @@ function updateConnectionStatus(status) {
 /**
  * Actualizar lista de usuarios
  */
+// Devuelve 'idle' | 'connecting' | 'ready' | 'failed'
+function getPeerReadiness(userId) {
+    const pc = rtcPeers.get(userId);
+    if (!pc) return 'idle';
+    const state = pc.connectionState || pc.iceConnectionState;
+    if (state === 'failed' || state === 'closed') return 'failed';
+    if (state === 'connected') return 'ready';
+    return 'connecting';
+}
+
+function applyConnLabelToItem(userItem, user) {
+    if (!userItem) return;
+    userItem.classList.remove('conn-connecting', 'conn-ready', 'conn-failed');
+    let label = userItem.querySelector('.conn-label');
+    let dot = userItem.querySelector('.conn-dot');
+    if (!selectedContacts.has(user)) {
+        if (label) label.textContent = '';
+        return;
+    }
+    if (!dot) {
+        dot = document.createElement('span');
+        dot.className = 'conn-dot';
+        userItem.insertBefore(dot, userItem.firstChild);
+    }
+    if (!label) {
+        label = document.createElement('span');
+        label.className = 'conn-label';
+        userItem.appendChild(label);
+    }
+    const state = getPeerReadiness(user);
+    if (state === 'ready') {
+        userItem.classList.add('conn-ready');
+        label.textContent = 'LISTO';
+    } else if (state === 'failed') {
+        userItem.classList.add('conn-failed');
+        label.textContent = 'ERROR';
+    } else {
+        userItem.classList.add('conn-connecting');
+        label.textContent = 'CONECTANDO...';
+    }
+}
+
+function refreshConnLabels() {
+    selectedContacts.forEach((user) => {
+        const userItem = document.getElementById(`user-${user}`);
+        applyConnLabelToItem(userItem, user);
+    });
+    updatePttButtonState();
+}
+
 function updateUsersList() {
     usersList.innerHTML = '';
     userCount.textContent = usersInChannel.length;
@@ -841,54 +898,61 @@ function updateUsersList() {
         const userItem = document.createElement('div');
         userItem.className = 'user-item';
         userItem.id = `user-${user}`;
-        
+
         userItem.innerHTML = `
             <span class="user-name">${user}</span>
             <span class="talking-indicator" style="display: none;">🔴 HABLANDO</span>
             <span class="selected-indicator" style="display: none;">✓ SELECCIONADO</span>
         `;
-        
+
         if (user === currentUser) {
             userItem.classList.add('self');
         }
-        
-        // Agregar click para seleccionar contacto
+
         if (user !== currentUser) {
             userItem.style.cursor = 'pointer';
             userItem.addEventListener('click', () => selectContact(user, userItem));
         }
-        
-        // Mostrar indicador si está seleccionado
+
         if (selectedContacts.has(user)) {
             userItem.classList.add('selected');
             userItem.querySelector('.selected-indicator').style.display = 'inline';
+            applyConnLabelToItem(userItem, user);
         }
-        
+
         usersList.appendChild(userItem);
     });
-    
-    // Actualizar estado del botón PTT basado en si hay contacto seleccionado
+
     updatePttButtonState();
 }
 
-/**
- * Actualizar estado del botón PTT
- */
+function anySelectedReady() {
+    for (const user of selectedContacts) {
+        if (getPeerReadiness(user) === 'ready') return true;
+    }
+    return false;
+}
+
 function updatePttButtonState() {
     if (!pttButton) return;
 
-    if (selectedContacts.size > 0) {
-        pttButton.disabled = false;
-        if (pttHint) {
-            const contacts = Array.from(selectedContacts);
-            const preview = contacts.slice(0, 3).join(', ');
-            const extra = contacts.length > 3 ? ` +${contacts.length - 3}` : '';
-            pttHint.innerHTML = `<strong>${preview}${extra}</strong><br>Mantener presionado para hablar`;
-        }
-    } else {
+    if (selectedContacts.size === 0) {
         pttButton.disabled = true;
-        if (pttHint) {
-            pttHint.innerHTML = 'Selecciona un contacto para hablar';
+        if (pttHint) pttHint.innerHTML = 'Selecciona un contacto para hablar';
+        return;
+    }
+
+    const ready = anySelectedReady();
+    pttButton.disabled = !ready;
+
+    if (pttHint) {
+        const contacts = Array.from(selectedContacts);
+        const preview = contacts.slice(0, 3).join(', ');
+        const extra = contacts.length > 3 ? ` +${contacts.length - 3}` : '';
+        if (ready) {
+            pttHint.innerHTML = `<strong>${preview}${extra}</strong><br>Mantener presionado para hablar`;
+        } else {
+            pttHint.innerHTML = `<strong>${preview}${extra}</strong><br><span style="color:#f1bf48">Conectando P2P, espera unos segundos...</span>`;
         }
     }
 }
@@ -899,8 +963,10 @@ function updatePttButtonState() {
 function selectContact(contactName, contactElement) {
     if (selectedContacts.has(contactName)) {
         selectedContacts.delete(contactName);
-        contactElement.classList.remove('selected');
+        contactElement.classList.remove('selected', 'conn-connecting', 'conn-ready', 'conn-failed');
         contactElement.querySelector('.selected-indicator').style.display = 'none';
+        const lbl = contactElement.querySelector('.conn-label');
+        if (lbl) lbl.textContent = '';
         closePeerConnection(contactName);
     } else {
         selectedContacts.add(contactName);
@@ -910,6 +976,8 @@ function selectContact(contactName, contactElement) {
         connectWebRTC(contactName).catch(err => {
             console.error(`[WebRTC] Error pre-conectando con ${contactName}:`, err);
         });
+        // Pintar indicador "CONECTANDO..." de inmediato.
+        applyConnLabelToItem(contactElement, contactName);
     }
 
     updatePttButtonState();
