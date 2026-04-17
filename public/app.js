@@ -31,6 +31,7 @@ const RTC_CONFIG = {
 const rtcPeers = new Map();
 const rtcRemoteAudioEls = new Map();
 const rtcDataChannels = new Map(); // userId -> RTCDataChannel ('clip')
+const rtcPendingIce = new Map(); // userId -> RTCIceCandidateInit[] (buffer hasta tener remoteDescription)
 
 // ========== E2E (WebCrypto) ==========
 // Estrategia: cada usuario genera un par ECDH P-256.
@@ -207,6 +208,10 @@ function createPeerConnection(targetUserId, isInitiator = false) {
     }
 
     const pc = new RTCPeerConnection(RTC_CONFIG);
+    // Estado para "perfect negotiation" (manejo de glare).
+    pc._polite = String(currentUser) < String(targetUserId);
+    pc._makingOffer = false;
+    pc._ignoreOffer = false;
 
     pc.onicecandidate = (event) => {
         if (event.candidate && socket && socket.connected) {
@@ -236,7 +241,27 @@ function createPeerConnection(targetUserId, isInitiator = false) {
         console.log(`[WebRTC] ${targetUserId}: ${state}`);
         updateAudioStats();
         if (state === 'failed' || state === 'closed') {
+            const stillSelected = selectedContacts.has(targetUserId);
             closePeerConnection(targetUserId);
+            // Auto-reconectar si el contacto sigue seleccionado.
+            if (stillSelected && socket && socket.connected) {
+                console.log(`[WebRTC] Reintentando conexion con ${targetUserId}`);
+                setTimeout(() => {
+                    if (selectedContacts.has(targetUserId)) {
+                        connectWebRTC(targetUserId).catch((e) => console.warn('[WebRTC] Retry fallido:', e));
+                    }
+                }, 500);
+            }
+        }
+    };
+
+    // Algunas implementaciones disparan iceConnectionState antes que connectionState.
+    pc.oniceconnectionstatechange = () => {
+        if (pc.iceConnectionState === 'failed') {
+            try {
+                console.warn(`[WebRTC] ICE failed con ${targetUserId}, intentando restartIce.`);
+                pc.restartIce && pc.restartIce();
+            } catch (_) {}
         }
     };
 
@@ -282,6 +307,7 @@ function closePeerConnection(userId) {
     e2eSharedKeys.delete(userId);
     e2eKeyExchangeSent.delete(userId);
     e2ePendingClips.delete(userId);
+    rtcPendingIce.delete(userId);
 }
 
 function closeAllPeerConnections() {
@@ -317,12 +343,17 @@ function setMicEnabled(enabled) {
 
 async function connectWebRTC(targetUserId) {
     if (!socket || !socket.connected) return;
+
+    // Re-usar la conexion existente salvo que este realmente rota.
     if (rtcPeers.has(targetUserId)) {
         const existing = rtcPeers.get(targetUserId);
-        if (existing.connectionState === 'connected' || existing.connectionState === 'connecting') {
+        const state = existing.connectionState;
+        if (state === 'failed' || state === 'closed') {
+            closePeerConnection(targetUserId);
+        } else {
+            // 'new' | 'connecting' | 'connected' | 'disconnected': dejarla seguir.
             return;
         }
-        closePeerConnection(targetUserId);
     }
 
     // Disparamos el intercambio E2E en paralelo (no bloquea el media path).
@@ -335,10 +366,17 @@ async function connectWebRTC(targetUserId) {
         pc.addTrack(track, stream);
     });
 
-    const offer = await pc.createOffer({ offerToReceiveAudio: true });
-    await pc.setLocalDescription(offer);
-    socket.emit('p2p-offer', { targetUserId, offer });
-    console.log(`[WebRTC] Offer sent to ${targetUserId}`);
+    try {
+        pc._makingOffer = true;
+        const offer = await pc.createOffer({ offerToReceiveAudio: true });
+        await pc.setLocalDescription(offer);
+        socket.emit('p2p-offer', { targetUserId, offer: pc.localDescription });
+        console.log(`[WebRTC] Offer sent to ${targetUserId} (polite=${pc._polite})`);
+    } catch (err) {
+        console.error('[WebRTC] Error creando offer:', err);
+    } finally {
+        pc._makingOffer = false;
+    }
 }
 
 async function handleIncomingOffer(fromUserId, offer) {
@@ -347,33 +385,101 @@ async function handleIncomingOffer(fromUserId, offer) {
     // Aseguramos que tenemos la clave local lista para responder al key-exchange.
     sendPublicKeyTo(fromUserId).catch((e) => console.warn('[E2E] Error enviando clave:', e));
 
-    const stream = await ensureMicStream();
     let pc = rtcPeers.get(fromUserId);
     if (!pc) {
         pc = createPeerConnection(fromUserId, false);
+        const stream = await ensureMicStream();
         stream.getAudioTracks().forEach(track => {
             pc.addTrack(track, stream);
         });
     }
 
-    await pc.setRemoteDescription(new RTCSessionDescription(offer));
-    const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
-    socket.emit('p2p-answer', { targetUserId: fromUserId, answer });
-    console.log(`[WebRTC] Answer sent to ${fromUserId}`);
+    // Perfect negotiation: si llega offer cuando ya estamos negociando,
+    // el "polite" hace rollback y acepta la oferta del par; el "impolite" la ignora.
+    const offerCollision = pc._makingOffer || pc.signalingState !== 'stable';
+    pc._ignoreOffer = !pc._polite && offerCollision;
+    if (pc._ignoreOffer) {
+        console.warn(`[WebRTC] Glare: ignorando offer de ${fromUserId} (impolite).`);
+        return;
+    }
+
+    try {
+        if (offerCollision && pc._polite) {
+            console.warn(`[WebRTC] Glare: rollback local antes de aceptar offer de ${fromUserId} (polite).`);
+            await Promise.all([
+                pc.setLocalDescription({ type: 'rollback' }).catch(() => {}),
+                pc.setRemoteDescription(new RTCSessionDescription(offer))
+            ]);
+        } else {
+            await pc.setRemoteDescription(new RTCSessionDescription(offer));
+        }
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        socket.emit('p2p-answer', { targetUserId: fromUserId, answer: pc.localDescription });
+        console.log(`[WebRTC] Answer sent to ${fromUserId}`);
+        await flushPendingIce(fromUserId);
+    } catch (err) {
+        console.error('[WebRTC] Error procesando offer:', err);
+    }
 }
 
 async function handleIncomingAnswer(fromUserId, answer) {
     const pc = rtcPeers.get(fromUserId);
     if (!pc) return;
-    await pc.setRemoteDescription(new RTCSessionDescription(answer));
-    console.log(`[WebRTC] Answer received from ${fromUserId}`);
+    if (pc.signalingState !== 'have-local-offer') {
+        console.warn(`[WebRTC] Answer de ${fromUserId} ignorado: signalingState=${pc.signalingState}`);
+        return;
+    }
+    try {
+        await pc.setRemoteDescription(new RTCSessionDescription(answer));
+        console.log(`[WebRTC] Answer received from ${fromUserId}`);
+        await flushPendingIce(fromUserId);
+    } catch (err) {
+        console.error('[WebRTC] Error aplicando answer:', err);
+    }
 }
 
 async function handleIceCandidate(fromUserId, candidate) {
     const pc = rtcPeers.get(fromUserId);
-    if (!pc) return;
-    await pc.addIceCandidate(new RTCIceCandidate(candidate));
+    if (!pc) {
+        // Llego ICE antes que la oferta -> bufferear hasta crear el peer.
+        bufferPendingIce(fromUserId, candidate);
+        return;
+    }
+    // Sin remoteDescription todavia -> bufferear; si no, addIceCandidate falla.
+    if (!pc.remoteDescription || !pc.remoteDescription.type) {
+        bufferPendingIce(fromUserId, candidate);
+        return;
+    }
+    try {
+        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+    } catch (err) {
+        if (!pc._ignoreOffer) {
+            console.error('[WebRTC] Error con ICE candidate:', err);
+        }
+    }
+}
+
+function bufferPendingIce(userId, candidate) {
+    if (!rtcPendingIce.has(userId)) rtcPendingIce.set(userId, []);
+    rtcPendingIce.get(userId).push(candidate);
+}
+
+async function flushPendingIce(userId) {
+    const queue = rtcPendingIce.get(userId);
+    if (!queue || queue.length === 0) return;
+    const pc = rtcPeers.get(userId);
+    if (!pc || !pc.remoteDescription || !pc.remoteDescription.type) return;
+    rtcPendingIce.set(userId, []);
+    for (const candidate of queue) {
+        try {
+            await pc.addIceCandidate(new RTCIceCandidate(candidate));
+        } catch (err) {
+            if (!pc._ignoreOffer) {
+                console.error('[WebRTC] Error aplicando ICE bufferizado:', err);
+            }
+        }
+    }
 }
 
 // ========== Transporte de clips P2P (DataChannel) ==========
