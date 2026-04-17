@@ -30,6 +30,116 @@ const RTC_CONFIG = {
 };
 const rtcPeers = new Map();
 const rtcRemoteAudioEls = new Map();
+const rtcDataChannels = new Map(); // userId -> RTCDataChannel ('clip')
+
+// ========== E2E (WebCrypto) ==========
+// Estrategia: cada usuario genera un par ECDH P-256.
+// Al seleccionar un contacto, ambos extremos intercambian la clave publica
+// via el canal de senalizacion y derivan una AES-GCM 256 unica por par.
+// El servidor solo enruta y nunca ve la clave compartida ni el plano.
+const E2E_ALGO = 'ECDH-P256-AESGCM';
+let e2eLocalKeyPair = null;
+let e2eLocalPublicJwk = null;
+const e2eSharedKeys = new Map(); // userId -> CryptoKey AES-GCM
+const e2eKeyExchangeSent = new Set(); // userId al que ya enviamos clave
+const e2ePendingClips = new Map(); // userId -> Map<msgId, { mimeType, total, parts: ArrayBuffer[] }>
+
+async function ensureLocalKeyPair() {
+    if (e2eLocalKeyPair) return e2eLocalKeyPair;
+    if (!window.crypto || !window.crypto.subtle) {
+        console.warn('[E2E] WebCrypto no disponible: el cifrado E2E queda deshabilitado.');
+        return null;
+    }
+    e2eLocalKeyPair = await crypto.subtle.generateKey(
+        { name: 'ECDH', namedCurve: 'P-256' },
+        true,
+        ['deriveKey', 'deriveBits']
+    );
+    e2eLocalPublicJwk = await crypto.subtle.exportKey('jwk', e2eLocalKeyPair.publicKey);
+    return e2eLocalKeyPair;
+}
+
+async function sendPublicKeyTo(targetUserId) {
+    if (!socket || !socket.connected) return;
+    const keyPair = await ensureLocalKeyPair();
+    if (!keyPair || !e2eLocalPublicJwk) return;
+    const publicKey = btoa(JSON.stringify(e2eLocalPublicJwk));
+    socket.emit('key-exchange', {
+        targetUserId,
+        publicKey,
+        algorithm: E2E_ALGO
+    });
+    e2eKeyExchangeSent.add(targetUserId);
+    console.log(`[E2E] Clave publica enviada a ${targetUserId}`);
+}
+
+async function deriveSharedKeyFrom(fromUserId, publicKeyB64) {
+    const keyPair = await ensureLocalKeyPair();
+    if (!keyPair) return null;
+    let remoteJwk;
+    try {
+        remoteJwk = JSON.parse(atob(publicKeyB64));
+    } catch (e) {
+        console.error('[E2E] Clave publica recibida invalida:', e);
+        return null;
+    }
+    try {
+        const remotePublicKey = await crypto.subtle.importKey(
+            'jwk',
+            remoteJwk,
+            { name: 'ECDH', namedCurve: 'P-256' },
+            false,
+            []
+        );
+        const sharedKey = await crypto.subtle.deriveKey(
+            { name: 'ECDH', public: remotePublicKey },
+            keyPair.privateKey,
+            { name: 'AES-GCM', length: 256 },
+            false,
+            ['encrypt', 'decrypt']
+        );
+        e2eSharedKeys.set(fromUserId, sharedKey);
+        console.log(`[E2E] Clave compartida derivada con ${fromUserId}`);
+
+        // Reciprocidad: si todavia no enviamos la nuestra, hazlo.
+        if (!e2eKeyExchangeSent.has(fromUserId)) {
+            await sendPublicKeyTo(fromUserId);
+        }
+        return sharedKey;
+    } catch (err) {
+        console.error('[E2E] Error derivando clave compartida:', err);
+        return null;
+    }
+}
+
+async function encryptForPeer(userId, plaintextBuffer) {
+    const key = e2eSharedKeys.get(userId);
+    if (!key) return null;
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ciphertext = await crypto.subtle.encrypt(
+        { name: 'AES-GCM', iv },
+        key,
+        plaintextBuffer
+    );
+    return {
+        iv: arrayBufferToBase64(iv.buffer),
+        ciphertext: arrayBufferToBase64(ciphertext)
+    };
+}
+
+async function decryptFromPeer(userId, ivB64, ciphertextB64) {
+    const key = e2eSharedKeys.get(userId);
+    if (!key) return null;
+    const iv = new Uint8Array(base64ToArrayBuffer(ivB64));
+    const ciphertext = base64ToArrayBuffer(ciphertextB64);
+    if (!ciphertext) return null;
+    const plaintext = await crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv },
+        key,
+        ciphertext
+    );
+    return plaintext;
+}
 
 // Elementos del DOM
 const authPanel = document.getElementById('authPanel');
@@ -63,12 +173,35 @@ function updateAudioStats() {
     const peers = rtcPeers.size;
     const connected = Array.from(rtcPeers.values())
         .filter(pc => pc.connectionState === 'connected').length;
-    audioStats.textContent = `WebRTC | RTT: ${rtt} | Peers: ${connected}/${peers}`;
+    const dcOpen = Array.from(rtcDataChannels.values()).filter(dc => dc.readyState === 'open').length;
+    const e2e = e2eSharedKeys.size;
+    audioStats.textContent = `WebRTC | RTT: ${rtt} | Peers: ${connected}/${peers} | DC: ${dcOpen} | E2E: ${e2e}`;
 }
 
 // ========== WEBRTC (AUDIO EN TIEMPO REAL) ==========
 
-function createPeerConnection(targetUserId) {
+function attachDataChannel(targetUserId, dc) {
+    rtcDataChannels.set(targetUserId, dc);
+    dc.binaryType = 'arraybuffer';
+    dc.onopen = () => {
+        console.log(`[WebRTC] DataChannel '${dc.label}' abierto con ${targetUserId}`);
+        updateAudioStats();
+    };
+    dc.onclose = () => {
+        if (rtcDataChannels.get(targetUserId) === dc) {
+            rtcDataChannels.delete(targetUserId);
+        }
+        updateAudioStats();
+    };
+    dc.onerror = (e) => {
+        console.warn(`[WebRTC] DataChannel error con ${targetUserId}:`, e);
+    };
+    dc.onmessage = (event) => {
+        handleDataChannelMessage(targetUserId, event.data);
+    };
+}
+
+function createPeerConnection(targetUserId, isInitiator = false) {
     if (rtcPeers.has(targetUserId)) {
         closePeerConnection(targetUserId);
     }
@@ -107,6 +240,21 @@ function createPeerConnection(targetUserId) {
         }
     };
 
+    pc.ondatachannel = (event) => {
+        if (event.channel && event.channel.label === 'clip') {
+            attachDataChannel(targetUserId, event.channel);
+        }
+    };
+
+    if (isInitiator) {
+        try {
+            const dc = pc.createDataChannel('clip', { ordered: true });
+            attachDataChannel(targetUserId, dc);
+        } catch (err) {
+            console.warn('[WebRTC] No se pudo crear DataChannel:', err);
+        }
+    }
+
     rtcPeers.set(targetUserId, pc);
     return pc;
 }
@@ -117,14 +265,23 @@ function closePeerConnection(userId) {
         pc.onicecandidate = null;
         pc.ontrack = null;
         pc.onconnectionstatechange = null;
+        pc.ondatachannel = null;
         pc.close();
         rtcPeers.delete(userId);
+    }
+    const dc = rtcDataChannels.get(userId);
+    if (dc) {
+        try { dc.close(); } catch (_) {}
+        rtcDataChannels.delete(userId);
     }
     const audioEl = rtcRemoteAudioEls.get(userId);
     if (audioEl) {
         audioEl.srcObject = null;
         rtcRemoteAudioEls.delete(userId);
     }
+    e2eSharedKeys.delete(userId);
+    e2eKeyExchangeSent.delete(userId);
+    e2ePendingClips.delete(userId);
 }
 
 function closeAllPeerConnections() {
@@ -168,8 +325,11 @@ async function connectWebRTC(targetUserId) {
         closePeerConnection(targetUserId);
     }
 
+    // Disparamos el intercambio E2E en paralelo (no bloquea el media path).
+    sendPublicKeyTo(targetUserId).catch((e) => console.warn('[E2E] Error enviando clave:', e));
+
     const stream = await ensureMicStream();
-    const pc = createPeerConnection(targetUserId);
+    const pc = createPeerConnection(targetUserId, true);
 
     stream.getAudioTracks().forEach(track => {
         pc.addTrack(track, stream);
@@ -184,10 +344,13 @@ async function connectWebRTC(targetUserId) {
 async function handleIncomingOffer(fromUserId, offer) {
     if (!socket || !socket.connected) return;
 
+    // Aseguramos que tenemos la clave local lista para responder al key-exchange.
+    sendPublicKeyTo(fromUserId).catch((e) => console.warn('[E2E] Error enviando clave:', e));
+
     const stream = await ensureMicStream();
     let pc = rtcPeers.get(fromUserId);
     if (!pc) {
-        pc = createPeerConnection(fromUserId);
+        pc = createPeerConnection(fromUserId, false);
         stream.getAudioTracks().forEach(track => {
             pc.addTrack(track, stream);
         });
@@ -211,6 +374,66 @@ async function handleIceCandidate(fromUserId, candidate) {
     const pc = rtcPeers.get(fromUserId);
     if (!pc) return;
     await pc.addIceCandidate(new RTCIceCandidate(candidate));
+}
+
+// ========== Transporte de clips P2P (DataChannel) ==========
+// Formato del mensaje JSON enviado por DataChannel:
+//   { v:1, type:'clip', msgId, mimeType, dataB64 }
+// El DataChannel viaja sobre SCTP/DTLS: cifrado hop-by-hop entre pares (E2E real, sin servidor).
+const DATA_CHANNEL_CLIP_LIMIT = 200 * 1024; // tamano maximo razonable por mensaje
+
+function isPeerDataChannelOpen(userId) {
+    const dc = rtcDataChannels.get(userId);
+    return !!dc && dc.readyState === 'open';
+}
+
+async function sendClipP2P(userId, arrayBuffer, mimeType) {
+    if (!isPeerDataChannelOpen(userId)) return false;
+    const dc = rtcDataChannels.get(userId);
+    if (!arrayBuffer || arrayBuffer.byteLength === 0) return false;
+    if (arrayBuffer.byteLength > DATA_CHANNEL_CLIP_LIMIT) {
+        console.warn(`[P2P] Clip muy grande (${arrayBuffer.byteLength}b) para DataChannel; usando relay E2E.`);
+        return false;
+    }
+    try {
+        const dataB64 = arrayBufferToBase64(arrayBuffer);
+        const msg = JSON.stringify({
+            v: 1,
+            type: 'clip',
+            msgId: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            mimeType: mimeType || 'audio/webm',
+            dataB64
+        });
+        dc.send(msg);
+        console.log(`[P2P] Clip enviado por DataChannel a ${userId} (${arrayBuffer.byteLength}b)`);
+        return true;
+    } catch (err) {
+        console.error('[P2P] Error enviando clip por DataChannel:', err);
+        return false;
+    }
+}
+
+function handleDataChannelMessage(fromUserId, data) {
+    if (typeof data !== 'string') return;
+    let msg;
+    try { msg = JSON.parse(data); } catch (_) { return; }
+    if (!msg || msg.v !== 1) return;
+
+    if (msg.type === 'clip' && typeof msg.dataB64 === 'string') {
+        try {
+            // Llega ya descifrado (DTLS), basta con reconstruir y agregar al historial.
+            const buf = base64ToArrayBuffer(msg.dataB64);
+            if (!buf) return;
+            const audioBase64 = arrayBufferToBase64(buf);
+            addHistoryMessage('audio', {
+                user: fromUserId,
+                audioData: audioBase64,
+                mimeType: msg.mimeType || 'audio/webm'
+            });
+        } catch (err) {
+            console.error('[P2P] Error procesando clip por DataChannel:', err);
+        }
+    }
 }
 
 async function connectWebRTCToSelectedContacts() {
@@ -272,6 +495,9 @@ function connectToServer() {
             startPingHeartbeat();
             pingSentAtMs = performance.now();
             socket.emit('ping');
+
+            // Pre-genera el par ECDH local para no introducir latencia al primer key-exchange.
+            ensureLocalKeyPair().catch((e) => console.warn('[E2E] No se pudo generar par ECDH:', e));
 
             socket.emit('join-channel', {
                 userId: currentUser,
@@ -342,10 +568,39 @@ function connectToServer() {
         });
 
         // El audio en vivo va por WebRTC, no por audio-broadcast.
-        // audio-broadcast solo se usa para clips de historial (mode: 'full').
-        socket.on('audio-broadcast', (data) => {
-            if (data.mode === 'full') {
-                addHistoryMessage('audio', { user: data.userId, audioData: data.audioData, mimeType: data.mimeType });
+        // audio-broadcast solo se usa como fallback para clips de historial.
+        // Si llega cifrado E2E (AES-GCM) lo desciframos con la clave compartida.
+        socket.on('audio-broadcast', async (data) => {
+            if (!data || data.mode !== 'full') return;
+            try {
+                if (data.encryption && data.encryption.algorithm === 'AES-GCM') {
+                    const plain = await decryptFromPeer(data.userId, data.encryption.iv, data.audioData);
+                    if (!plain) {
+                        console.warn(`[E2E] No se pudo descifrar clip de ${data.userId} (sin clave compartida).`);
+                        return;
+                    }
+                    const audioBase64 = arrayBufferToBase64(plain);
+                    addHistoryMessage('audio', {
+                        user: data.userId,
+                        audioData: audioBase64,
+                        mimeType: data.encryption.mimeType || data.mimeType || 'audio/webm'
+                    });
+                } else {
+                    addHistoryMessage('audio', { user: data.userId, audioData: data.audioData, mimeType: data.mimeType });
+                }
+            } catch (err) {
+                console.error('[E2E] Error procesando audio-broadcast:', err);
+            }
+        });
+
+        // Recibimos la clave publica del par y derivamos la clave AES-GCM compartida.
+        socket.on('key-exchange', async (data) => {
+            const { from, publicKey } = data || {};
+            if (!from || !publicKey) return;
+            try {
+                await deriveSharedKeyFrom(from, publicKey);
+            } catch (err) {
+                console.error('[E2E] Error en key-exchange:', err);
             }
         });
 
@@ -654,15 +909,47 @@ async function startRecording() {
                 try {
                     if (mediaRecorderChunks.length === 0) return;
                     const blob = new Blob(mediaRecorderChunks, { type: mediaRecorderMimeType });
-                    const base64Audio = await blobToBase64(blob);
+                    const arrayBuffer = await blob.arrayBuffer();
+                    const base64Audio = arrayBufferToBase64(arrayBuffer);
                     addHistoryMessage('audio', { user: currentUser, audioData: base64Audio, mimeType: mediaRecorderMimeType });
 
-                    // Enviar clip completo para historial del otro usuario.
                     const targetUsers = Array.from(selectedContacts);
-                    if (socket && socket.connected && targetUsers.length > 0) {
+                    if (!socket || !socket.connected || targetUsers.length === 0) return;
+
+                    // Por cada destinatario:
+                    //   1) Intentar DataChannel P2P (DTLS, no toca el servidor).
+                    //   2) Fallback: relay via socket, pero cifrado E2E con AES-GCM.
+                    //   3) Ultimo recurso: relay en claro (solo si no hay clave aun).
+                    const relayPlain = [];
+                    for (const target of targetUsers) {
+                        const sentP2P = await sendClipP2P(target, arrayBuffer, mediaRecorderMimeType);
+                        if (sentP2P) continue;
+
+                        const encrypted = await encryptForPeer(target, arrayBuffer);
+                        if (encrypted) {
+                            socket.emit('audio-stream', {
+                                channel: currentChannel,
+                                targetUser: target,
+                                audioData: encrypted.ciphertext,
+                                mode: 'full',
+                                mimeType: mediaRecorderMimeType,
+                                encryption: {
+                                    algorithm: 'AES-GCM',
+                                    iv: encrypted.iv,
+                                    mimeType: mediaRecorderMimeType
+                                }
+                            });
+                            console.log(`[E2E] Clip enviado cifrado a ${target}`);
+                        } else {
+                            relayPlain.push(target);
+                        }
+                    }
+
+                    if (relayPlain.length > 0) {
+                        console.warn('[E2E] Sin clave compartida con:', relayPlain.join(', '), '- enviando en claro como ultimo recurso.');
                         socket.emit('audio-stream', {
                             channel: currentChannel,
-                            targetUsers,
+                            targetUsers: relayPlain,
                             audioData: base64Audio,
                             mode: 'full',
                             mimeType: mediaRecorderMimeType

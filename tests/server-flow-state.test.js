@@ -2,7 +2,8 @@ const {
   moveSocketToChannel,
   removeSocketFromChannel,
   findSocketIdByUserId,
-  getUsersInChannel
+  getUsersInChannel,
+  areUsersInSameChannel
 } = require('../server/core');
 
 describe('server/core flow state', () => {
@@ -61,6 +62,19 @@ describe('server/core flow state', () => {
     ]);
     expect(findSocketIdByUserId(users, 'luis')).toBe('s2');
     expect(findSocketIdByUserId(users, 'maria')).toBe(null);
+  });
+
+  it('areUsersInSameChannel solo enruta entre pares en el mismo canal', () => {
+    const users = new Map([
+      ['s1', { userId: 'ana', channel: 'general' }],
+      ['s2', { userId: 'luis', channel: 'general' }],
+      ['s3', { userId: 'maria', channel: 'soporte' }]
+    ]);
+
+    expect(areUsersInSameChannel(users, 's1', 'luis')).toBe('s2');
+    expect(areUsersInSameChannel(users, 's1', 'maria')).toBe(null);
+    expect(areUsersInSameChannel(users, 'inexistente', 'luis')).toBe(null);
+    expect(areUsersInSameChannel(users, 's1', '')).toBe(null);
   });
 
   it('getUsersInChannel refleja estado tras movimiento y desconexion', () => {

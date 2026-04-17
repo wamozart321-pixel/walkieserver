@@ -10,12 +10,17 @@ const {
   isValidUserIdFormat,
   isValidPasswordFormat,
   isValidAppUser,
+  isBcryptHash,
+  hashPassword,
   resolveTargetUsers,
   buildAudioPayload,
   getUsersInChannel,
   moveSocketToChannel,
   removeSocketFromChannel,
-  findSocketIdByUserId
+  areUsersInSameChannel,
+  isValidSdpPayload,
+  isValidIceCandidate,
+  isValidPublicKey
 } = require('./core');
 
 const app = express();
@@ -50,6 +55,7 @@ if (fs.existsSync(certDir)) {
 const io = new Server(server, {
   transports: ['websocket'],
   perMessageDeflate: false,
+  maxHttpBufferSize: 8 * 1024 * 1024,
   cors: {
     origin: '*',
     methods: ['GET', 'POST']
@@ -70,23 +76,41 @@ const userStoreDir = path.join(__dirname, '../data');
 const userStoreFile = path.join(userStoreDir, 'app-users.json');
 
 const appUsers = buildAppUsers(APP_USERS_RAW);
-const runtimeAppUsers = new Map(appUsers);
+const runtimeAppUsers = new Map();
+// Hashea cualquier clave en texto plano que venga desde APP_USERS (env).
+for (const [u, p] of appUsers.entries()) {
+  runtimeAppUsers.set(u, isBcryptHash(p) ? p : hashPassword(p));
+}
 
 function loadPersistedUsers() {
-  if (!fs.existsSync(userStoreFile)) return;
+  if (!fs.existsSync(userStoreFile)) return false;
+  let mutated = false;
   try {
     const raw = fs.readFileSync(userStoreFile, 'utf8');
     const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== 'object') return;
+    if (!parsed || typeof parsed !== 'object') return false;
 
     for (const [userId, password] of Object.entries(parsed)) {
-      if (isValidUserIdFormat(userId) && isValidPasswordFormat(password)) {
+      if (!isValidUserIdFormat(userId)) continue;
+
+      if (isBcryptHash(password)) {
         runtimeAppUsers.set(userId, password);
+        continue;
+      }
+
+      // Migracion automatica: clave en texto plano -> hash bcrypt.
+      if (isValidPasswordFormat(password)) {
+        const hashed = hashPassword(password);
+        runtimeAppUsers.set(userId, hashed);
+        mutated = true;
+        console.log(`Migrando clave de '${userId}' a bcrypt.`);
       }
     }
   } catch (err) {
     console.error('No se pudo cargar data/app-users.json:', err.message);
+    return false;
   }
+  return mutated;
 }
 
 function persistUsers() {
@@ -101,7 +125,11 @@ function persistUsers() {
   }
 }
 
-loadPersistedUsers();
+const migratedOnLoad = loadPersistedUsers();
+if (migratedOnLoad) {
+  persistUsers();
+  console.log('Claves migradas a bcrypt y persistidas en data/app-users.json');
+}
 
 app.use(express.static(path.join(__dirname, '../public')));
 
@@ -142,7 +170,7 @@ io.on('connection', (socket) => {
       return;
     }
 
-    runtimeAppUsers.set(requestedUserId, requestedPassword);
+    runtimeAppUsers.set(requestedUserId, hashPassword(requestedPassword));
     persistUsers();
     socket.emit('register-success', { message: 'Usuario creado. Ahora puedes iniciar sesion.' });
   });
@@ -190,14 +218,23 @@ io.on('connection', (socket) => {
     socket.emit('join-success', { userId: authUserId, channel: requestedChannel });
   });
 
+  // Solo se permite si el socket esta autenticado y el destinatario esta en el mismo canal.
+  function requirePeer(targetUserId) {
+    if (!authenticatedSockets.has(socket.id)) return null;
+    if (typeof targetUserId !== 'string' || !targetUserId.trim()) return null;
+    return areUsersInSameChannel(users, socket.id, targetUserId);
+  }
+
   socket.on('audio-stream', (data) => {
-    const { channel, audioData, mode, transmissionId, mimeType, format, sampleRate, targetUser, targetUsers } = data || {};
+    if (!authenticatedSockets.has(socket.id)) return;
+    const { channel, audioData, mode, transmissionId, mimeType, format, sampleRate, targetUser, targetUsers, encryption } = data || {};
     const user = users.get(socket.id);
 
-    if (!user || !channel || !audioData) return;
+    if (!user || !channel || user.channel !== channel || !audioData) return;
 
+    // El servidor jamas decodifica el audio; los datos pueden ser ciphertext.
     const payload = buildAudioPayload(
-      { audioData, mode, transmissionId, mimeType, format, sampleRate },
+      { audioData, mode, transmissionId, mimeType, format, sampleRate, encryption },
       user.userId
     );
 
@@ -218,45 +255,59 @@ io.on('connection', (socket) => {
 
   socket.on('p2p-offer', (data) => {
     const { targetUserId, offer } = data || {};
-    const targetSocketId = findSocketIdByUserId(users, targetUserId);
-    if (targetSocketId) {
-      io.to(targetSocketId).emit('p2p-offer', {
-        from: users.get(socket.id)?.userId,
-        offer
-      });
-    }
+    if (!isValidSdpPayload(offer)) return;
+    const targetSocketId = requirePeer(targetUserId);
+    if (!targetSocketId) return;
+    io.to(targetSocketId).emit('p2p-offer', {
+      from: users.get(socket.id)?.userId,
+      offer
+    });
   });
 
   socket.on('p2p-answer', (data) => {
     const { targetUserId, answer } = data || {};
-    const targetSocketId = findSocketIdByUserId(users, targetUserId);
-    if (targetSocketId) {
-      io.to(targetSocketId).emit('p2p-answer', {
-        from: users.get(socket.id)?.userId,
-        answer
-      });
-    }
+    if (!isValidSdpPayload(answer)) return;
+    const targetSocketId = requirePeer(targetUserId);
+    if (!targetSocketId) return;
+    io.to(targetSocketId).emit('p2p-answer', {
+      from: users.get(socket.id)?.userId,
+      answer
+    });
   });
 
   socket.on('ice-candidate', (data) => {
     const { targetUserId, candidate } = data || {};
-    const targetSocketId = findSocketIdByUserId(users, targetUserId);
-    if (targetSocketId) {
-      io.to(targetSocketId).emit('ice-candidate', {
-        from: users.get(socket.id)?.userId,
-        candidate
-      });
-    }
+    if (!isValidIceCandidate(candidate)) return;
+    const targetSocketId = requirePeer(targetUserId);
+    if (!targetSocketId) return;
+    io.to(targetSocketId).emit('ice-candidate', {
+      from: users.get(socket.id)?.userId,
+      candidate
+    });
+  });
+
+  // Intercambio de claves publicas para E2E (ECDH). El servidor solo enruta.
+  socket.on('key-exchange', (data) => {
+    const { targetUserId } = data || {};
+    if (!isValidPublicKey(data)) return;
+    const targetSocketId = requirePeer(targetUserId);
+    if (!targetSocketId) return;
+    io.to(targetSocketId).emit('key-exchange', {
+      from: users.get(socket.id)?.userId,
+      publicKey: data.publicKey,
+      algorithm: data.algorithm || 'ECDH-P256'
+    });
   });
 
   socket.on('voice-activity', (data) => {
+    if (!authenticatedSockets.has(socket.id)) return;
     const { channel, isTalking } = data || {};
     const user = users.get(socket.id);
 
-    if (user) {
+    if (user && user.channel === channel) {
       socket.to(channel).emit('voice-activity', {
         userId: user.userId,
-        isTalking
+        isTalking: !!isTalking
       });
     }
   });
