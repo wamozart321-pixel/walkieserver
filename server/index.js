@@ -17,6 +17,7 @@ const {
   getUsersInChannel,
   moveSocketToChannel,
   removeSocketFromChannel,
+  findSocketIdByUserId,
   areUsersInSameChannel,
   isValidSdpPayload,
   isValidIceCandidate,
@@ -52,12 +53,21 @@ if (fs.existsSync(certDir)) {
   server = http.createServer(app);
 }
 
+// Origenes permitidos. Por defecto '*' para no romper instalaciones existentes,
+// pero conviene fijarlo en produccion (ALLOWED_ORIGINS=https://midominio,...).
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '*')
+  .split(',')
+  .map((o) => o.trim())
+  .filter(Boolean);
+
 const io = new Server(server, {
+  // websocket puro: sin respaldo de long-polling. Si alguna red con proxy
+  // bloquea WebSocket, anadir 'polling' aqui.
   transports: ['websocket'],
   perMessageDeflate: false,
-  maxHttpBufferSize: 8 * 1024 * 1024,
+  maxHttpBufferSize: 4 * 1024 * 1024,
   cors: {
-    origin: '*',
+    origin: ALLOWED_ORIGINS.includes('*') ? '*' : ALLOWED_ORIGINS,
     methods: ['GET', 'POST']
   }
 });
@@ -65,9 +75,26 @@ const io = new Server(server, {
 const PORT = process.env.PORT || 3000;
 const HOST = '0.0.0.0';
 
-// Capa 1: autenticacion admin por HTTP Basic (protege toda la web + handshake WS)
+// Credenciales del administrador. Sirven para entrar como un usuario mas y,
+// si WEB_AUTH=true, para proteger toda la web con HTTP Basic.
 const AUTH_USER = process.env.AUTH_USER || 'admin';
 const AUTH_PASS = process.env.AUTH_PASS || 'cambiar-esta-clave';
+
+// Aviso al arrancar si se dejo la clave de ejemplo.
+if (AUTH_PASS === 'cambiar-esta-clave') {
+  console.warn('AVISO: AUTH_PASS tiene el valor por defecto. Define uno propio en el archivo .env');
+}
+
+// Protege la web entera con HTTP Basic. Antes habia un comentario que decia que
+// esto existia, pero el middleware no estaba puesto: cualquiera con acceso a la
+// red podia abrir la aplicacion.
+const WEB_AUTH = String(process.env.WEB_AUTH || 'false').toLowerCase() === 'true';
+
+// Registro de usuarios desde la pantalla de acceso. Estaba siempre abierto:
+// cualquiera podia crear cuentas ilimitadas y entrar al canal.
+const ALLOW_REGISTRATION = String(process.env.ALLOW_REGISTRATION ?? 'true').toLowerCase() === 'true';
+// Si se define, hace falta escribirla para poder registrarse.
+const REGISTRATION_CODE = process.env.REGISTRATION_CODE || '';
 
 // Capa 2: usuarios de la app (usuario:clave separados por coma)
 // Ejemplo: APP_USERS=ana:1234,luis:abcd,maria:clave
@@ -131,7 +158,57 @@ if (migratedOnLoad) {
   console.log('Claves migradas a bcrypt y persistidas en data/app-users.json');
 }
 
+// HTTP Basic opcional delante de todo (incluidos los archivos estaticos).
+if (WEB_AUTH) {
+  app.use((req, res, next) => {
+    // /health se deja libre para que los monitores externos sigan funcionando.
+    if (req.path === '/health') return next();
+
+    const header = req.headers.authorization || '';
+    if (header.startsWith('Basic ')) {
+      const decoded = Buffer.from(header.slice(6), 'base64').toString('utf8');
+      const separator = decoded.indexOf(':');
+      const user = decoded.slice(0, separator);
+      const pass = decoded.slice(separator + 1);
+      if (user === AUTH_USER && pass === AUTH_PASS) return next();
+    }
+
+    res.set('WWW-Authenticate', 'Basic realm="Walkie Talkie"');
+    return res.status(401).send('Acceso restringido');
+  });
+  console.log('Proteccion HTTP Basic activada para toda la web.');
+}
+
 app.use(express.static(path.join(__dirname, '../public')));
+
+/**
+ * Servidores ICE para WebRTC. Con solo STUN, dos usuarios detras de NAT
+ * simetrico o de un firewall corporativo no llegan a conectarse nunca; aqui se
+ * puede anadir un TURN por configuracion sin tocar el codigo del cliente.
+ */
+app.get('/ice-config', (req, res) => {
+  const iceServers = [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' }
+  ];
+
+  if (process.env.TURN_URL) {
+    const turn = { urls: process.env.TURN_URL.split(',').map((u) => u.trim()).filter(Boolean) };
+    if (process.env.TURN_USER) turn.username = process.env.TURN_USER;
+    if (process.env.TURN_PASS) turn.credential = process.env.TURN_PASS;
+    iceServers.push(turn);
+  }
+
+  res.json({ iceServers });
+});
+
+// Ajustes que el cliente necesita saber para pintar bien la pantalla de acceso.
+app.get('/app-config', (req, res) => {
+  res.json({
+    allowRegistration: ALLOW_REGISTRATION,
+    requiresInviteCode: ALLOW_REGISTRATION && REGISTRATION_CODE.length > 0
+  });
+});
 
 // Memoria en proceso (futuro: Redis)
 const users = new Map(); // socketId -> { userId, channel }
@@ -142,13 +219,65 @@ app.get('/health', (req, res) => {
   res.status(200).send('ok');
 });
 
+/**
+ * Limitador sencillo por socket y por accion (ventana deslizante).
+ * Evita que un cliente autenticado sature el canal o pruebe claves en bucle.
+ */
+const REGISTER_LIMIT = { max: 5, windowMs: 60_000 };
+const JOIN_LIMIT = { max: 20, windowMs: 60_000 };
+const AUDIO_LIMIT = { max: 120, windowMs: 10_000 };
+
+function allowAction(socket, action, limit) {
+  if (!socket._rateBuckets) socket._rateBuckets = new Map();
+
+  const now = Date.now();
+  const times = (socket._rateBuckets.get(action) || []).filter((t) => now - t < limit.windowMs);
+
+  if (times.length >= limit.max) {
+    socket._rateBuckets.set(action, times);
+    return false;
+  }
+
+  times.push(now);
+  socket._rateBuckets.set(action, times);
+  return true;
+}
+
+// Tamano maximo por mensaje de audio. maxHttpBufferSize permite hasta 8 MB por
+// paquete; un clip de voz normal no pasa de unos cientos de kilobytes.
+const MAX_AUDIO_BYTES = 2 * 1024 * 1024;
+
+function audioPayloadSize(audioData) {
+  if (!audioData) return 0;
+  if (typeof audioData === 'string') return audioData.length;
+  if (audioData.byteLength !== undefined) return audioData.byteLength;
+  if (audioData.length !== undefined) return audioData.length;
+  return 0;
+}
+
 io.on('connection', (socket) => {
   console.log(`Cliente conectado: ${socket.id}`);
 
   socket.on('register-user', (data) => {
-    const { userId, password } = data || {};
+    const { userId, password, code } = data || {};
     const requestedUserId = String(userId || '').trim();
     const requestedPassword = String(password || '');
+
+    if (!ALLOW_REGISTRATION) {
+      socket.emit('register-error', { message: 'El registro esta desactivado. Pide una cuenta al administrador.' });
+      return;
+    }
+
+    if (REGISTRATION_CODE && String(code || '') !== REGISTRATION_CODE) {
+      socket.emit('register-error', { message: 'Codigo de invitacion incorrecto.' });
+      return;
+    }
+
+    // Sin esto, un script podia crear cuentas sin limite.
+    if (!allowAction(socket, 'register', REGISTER_LIMIT)) {
+      socket.emit('register-error', { message: 'Demasiados intentos. Espera un momento.' });
+      return;
+    }
 
     if (!isValidUserIdFormat(requestedUserId)) {
       socket.emit('register-error', { message: 'Usuario invalido (3-20, letras/numeros/._-).' });
@@ -187,6 +316,12 @@ io.on('connection', (socket) => {
     }
 
     if (!existingAuthUser) {
+      // Limita los intentos de clave por conexion.
+      if (!allowAction(socket, 'join', JOIN_LIMIT)) {
+        socket.emit('auth-error', { message: 'Demasiados intentos. Espera un momento.' });
+        return;
+      }
+
       if (!isValidAppUser(requestedUserId, String(password), AUTH_USER, AUTH_PASS, runtimeAppUsers)) {
         socket.emit('auth-error', { message: 'Usuario o clave incorrectos.' });
         return;
@@ -198,6 +333,32 @@ io.on('connection', (socket) => {
     }
 
     const authUserId = authenticatedSockets.get(socket.id);
+
+    // Sesion unica por usuario. Con dos conexiones del mismo nombre (movil y PC,
+    // o dos pestanas), la senalizacion y el audio dirigido iban siempre al primer
+    // socket encontrado, asi que la sesion nueva se quedaba muda sin motivo
+    // aparente. Ahora la anterior se cierra de forma explicita.
+    const previousSocketId = findSocketIdByUserId(users, authUserId);
+    if (previousSocketId && previousSocketId !== socket.id) {
+      const previousSocket = io.sockets.sockets.get(previousSocketId);
+      const removed = removeSocketFromChannel(users, channels, previousSocketId);
+      authenticatedSockets.delete(previousSocketId);
+
+      if (removed) {
+        socket.to(removed.channel).emit('user-left', {
+          userId: removed.userId,
+          channel: removed.channel
+        });
+      }
+
+      if (previousSocket) {
+        previousSocket.emit('session-replaced', {
+          message: 'Has iniciado sesion en otro dispositivo.'
+        });
+        previousSocket.disconnect(true);
+      }
+      console.log(`${authUserId} inicio sesion en otro sitio; se cierra la sesion anterior.`);
+    }
 
     const movement = moveSocketToChannel(users, channels, socket.id, authUserId, requestedChannel);
     if (movement.previousChannel) {
@@ -231,6 +392,16 @@ io.on('connection', (socket) => {
     const user = users.get(socket.id);
 
     if (!user || !channel || user.channel !== channel || !audioData) return;
+
+    if (audioPayloadSize(audioData) > MAX_AUDIO_BYTES) {
+      console.warn(`Audio descartado de ${user.userId}: supera el tamano maximo.`);
+      return;
+    }
+
+    if (!allowAction(socket, 'audio', AUDIO_LIMIT)) {
+      // Silencioso a proposito: avisar en cada paquete generaria mas trafico.
+      return;
+    }
 
     // El servidor jamas decodifica el audio; los datos pueden ser ciphertext.
     const payload = buildAudioPayload(

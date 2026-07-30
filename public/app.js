@@ -1,5 +1,49 @@
 // Configuracion
-const SERVER_URL = window.location.origin;
+const SERVER_STORAGE_KEY = 'walkie.serverUrl';
+
+/**
+ * Direccion del servidor.
+ *
+ * En la web basta con el origen desde el que se sirve la pagina, pero la app de
+ * Android carga los archivos desde el propio telefono ("capacitor://localhost"),
+ * asi que ahi hay que decirle a que servidor conectarse. Se guarda para las
+ * siguientes veces.
+ */
+function isLocalPackage() {
+    const p = window.location.protocol;
+    return p === 'file:' || p === 'capacitor:' || window.location.hostname === 'localhost' && p !== 'http:' && p !== 'https:';
+}
+
+function getSavedServerUrl() {
+    try {
+        return localStorage.getItem(SERVER_STORAGE_KEY) || '';
+    } catch (_) {
+        return '';
+    }
+}
+
+function saveServerUrl(url) {
+    try {
+        if (url) localStorage.setItem(SERVER_STORAGE_KEY, url);
+        else localStorage.removeItem(SERVER_STORAGE_KEY);
+    } catch (_) {}
+}
+
+function normalizeServerUrl(raw) {
+    let url = String(raw || '').trim();
+    if (!url) return '';
+    if (!/^https?:\/\//i.test(url)) url = `http://${url}`;
+    return url.replace(/\/+$/, '');
+}
+
+function getServerUrl() {
+    const saved = getSavedServerUrl();
+    if (saved) return saved;
+    if (isLocalPackage()) return '';
+    return window.location.origin;
+}
+
+let SERVER_URL = getServerUrl();
 let socket = null;
 let currentStream = null; // Stream del micro (se mantiene vivo entre PTT)
 
@@ -9,6 +53,15 @@ let currentPassword = '';
 let currentChannel = 'general';
 let usersInChannel = [];
 const selectedContacts = new Set();
+
+// Estado de la lista de usuarios (para no rehacer el DOM en cada actualizacion).
+const userItems = new Map(); // userId -> elemento
+const talkingUsers = new Set(); // quien esta hablando ahora mismo
+
+// Audio del historial fuera del DOM.
+const HISTORY_LIMIT = 20;
+const historyClips = new Map(); // clipId -> { audioData, mimeType }
+let historyClipCounter = 0;
 
 let pingSentAtMs = 0;
 let lastRttMs = null;
@@ -31,6 +84,26 @@ const RTC_CONFIG = {
     // reduce de forma muy notable el tiempo hasta connectionState='connected'.
     iceCandidatePoolSize: 10
 };
+
+/**
+ * Pide al servidor la lista de servidores ICE. Permite anadir un TURN por
+ * configuracion (.env) sin tocar el codigo: con solo STUN, dos usuarios detras
+ * de NAT simetrico o de un firewall corporativo nunca llegan a conectarse.
+ */
+async function loadIceConfig() {
+    if (!SERVER_URL) return;
+    try {
+        const res = await fetch(`${SERVER_URL}/ice-config`, { cache: 'no-store' });
+        if (!res.ok) return;
+        const cfg = await res.json();
+        if (Array.isArray(cfg.iceServers) && cfg.iceServers.length > 0) {
+            RTC_CONFIG.iceServers = cfg.iceServers;
+            console.log(`[WebRTC] ${cfg.iceServers.length} servidores ICE cargados del servidor.`);
+        }
+    } catch (err) {
+        console.warn('[WebRTC] No se pudo leer /ice-config, se usan los STUN por defecto:', err.message);
+    }
+}
 const rtcPeers = new Map();
 const rtcRemoteAudioEls = new Map();
 const rtcDataChannels = new Map(); // userId -> RTCDataChannel ('clip')
@@ -163,13 +236,46 @@ const createChannelBtn = document.getElementById('createChannelBtn');
 const userCount = document.getElementById('userCount');
 const usersList = document.getElementById('usersList');
 const historyList = document.getElementById('historyList');
+const inviteGroup = document.getElementById('inviteGroup');
+const inviteCodeInput = document.getElementById('inviteCodeInput');
+const serverGroup = document.getElementById('serverGroup');
+const serverUrlInput = document.getElementById('serverUrlInput');
+const saveServerBtn = document.getElementById('saveServerBtn');
+const serverHint = document.getElementById('serverHint');
 const audioProfileSelect = document.getElementById('audioProfileSelect');
 const audioStats = document.getElementById('audioStats');
 const audioProfileHelp = document.getElementById('audioProfileHelp');
 const AudioContextClass = window.AudioContext || window.webkitAudioContext;
 
 if (!navigator.mediaDevices) {
-    alert('Tu navegador no soporta grabacion de audio. Por favor usa Chrome, Edge o Firefox.');
+    console.error('Este navegador no soporta captura de audio.');
+}
+
+/**
+ * Aviso no bloqueante. Sustituye a alert(), que en movil congela la interfaz
+ * y obliga a tocar dos veces para seguir.
+ */
+function showToast(message, kind = 'info', timeout = 4000) {
+    let host = document.getElementById('toastHost');
+    if (!host) {
+        host = document.createElement('div');
+        host.id = 'toastHost';
+        host.className = 'toast-host';
+        document.body.appendChild(host);
+    }
+
+    const toast = document.createElement('div');
+    toast.className = `toast toast-${kind}`;
+    toast.textContent = message;
+    host.appendChild(toast);
+
+    const remove = () => {
+        toast.classList.add('toast-out');
+        setTimeout(() => toast.remove(), 250);
+    };
+
+    toast.addEventListener('click', remove);
+    setTimeout(remove, timeout);
 }
 
 function updateAudioStats() {
@@ -180,7 +286,9 @@ function updateAudioStats() {
         .filter(pc => pc.connectionState === 'connected').length;
     const dcOpen = Array.from(rtcDataChannels.values()).filter(dc => dc.readyState === 'open').length;
     const e2e = e2eSharedKeys.size;
-    audioStats.textContent = `WebRTC | RTT: ${rtt} | Peers: ${connected}/${peers} | DC: ${dcOpen} | E2E: ${e2e}`;
+    const kbps = Math.round(getAudioProfile().bitrate / 1000);
+    audioStats.textContent =
+        `WebRTC ${kbps}kbps | RTT: ${rtt} | Directo: ${connected}/${peers} | Datos: ${dcOpen} | Cifrado: ${e2e}`;
 }
 
 // ========== WEBRTC (AUDIO EN TIEMPO REAL) ==========
@@ -348,6 +456,93 @@ function setMicEnabled(enabled) {
     currentStream.getAudioTracks().forEach(t => { t.enabled = enabled; });
 }
 
+// ========== Perfiles de audio ==========
+// El selector de la interfaz existia pero no hacia absolutamente nada desde que
+// se paso a WebRTC. Ahora ajusta de verdad el codec Opus en el SDP.
+const AUDIO_PROFILES = {
+    stable: { bitrate: 16000, dtx: 1, fec: 1, ptime: 40, label: 'Red mala: 16 kbps, mas resistente a cortes' },
+    balanced: { bitrate: 24000, dtx: 1, fec: 1, ptime: 20, label: 'Balanceado: 24 kbps' },
+    'low-latency': { bitrate: 32000, dtx: 0, fec: 0, ptime: 10, label: 'Baja latencia: 32 kbps, paquetes mas cortos' }
+};
+
+let currentAudioProfile = 'balanced';
+
+function getAudioProfile() {
+    return AUDIO_PROFILES[currentAudioProfile] || AUDIO_PROFILES.balanced;
+}
+
+/**
+ * Reescribe la linea fmtp de Opus del SDP con los parametros del perfil.
+ * Es la forma estandar de limitar el bitrate sin tocar el resto de la sesion.
+ */
+function applyAudioProfileToSdp(sdp) {
+    const profile = getAudioProfile();
+    if (!sdp) return sdp;
+
+    const opusMatch = sdp.match(/a=rtpmap:(\d+) opus\/48000/i);
+    if (!opusMatch) return sdp;
+
+    const payload = opusMatch[1];
+    const params = [
+        `maxaveragebitrate=${profile.bitrate}`,
+        `maxplaybackrate=48000`,
+        `stereo=0`,
+        `useinbandfec=${profile.fec}`,
+        `usedtx=${profile.dtx}`
+    ].join(';');
+
+    const fmtpRegex = new RegExp(`a=fmtp:${payload} ([^\\r\\n]*)`);
+    if (fmtpRegex.test(sdp)) {
+        sdp = sdp.replace(fmtpRegex, `a=fmtp:${payload} $1;${params}`);
+    } else {
+        sdp = sdp.replace(
+            new RegExp(`(a=rtpmap:${payload} opus/48000[^\\r\\n]*\\r?\\n)`),
+            `$1a=fmtp:${payload} ${params}\r\n`
+        );
+    }
+
+    if (profile.ptime) {
+        sdp = sdp.replace(/a=ptime:\d+/g, `a=ptime:${profile.ptime}`);
+        if (!/a=ptime:/.test(sdp)) {
+            sdp = sdp.replace(
+                new RegExp(`(a=rtpmap:${payload} opus/48000[^\\r\\n]*\\r?\\n)`),
+                `$1a=ptime:${profile.ptime}\r\n`
+            );
+        }
+    }
+
+    return sdp;
+}
+
+/**
+ * Aplica el bitrate tambien por RTCRtpSender, que es lo que respetan Chrome y
+ * Edge aunque el SDP pida otra cosa.
+ */
+async function applyProfileToSenders(pc) {
+    if (!pc || typeof pc.getSenders !== 'function') return;
+    const profile = getAudioProfile();
+
+    for (const sender of pc.getSenders()) {
+        if (!sender.track || sender.track.kind !== 'audio') continue;
+        try {
+            const params = sender.getParameters();
+            if (!params.encodings || params.encodings.length === 0) {
+                params.encodings = [{}];
+            }
+            params.encodings[0].maxBitrate = profile.bitrate;
+            await sender.setParameters(params);
+        } catch (err) {
+            console.warn('[WebRTC] No se pudo aplicar el bitrate al sender:', err);
+        }
+    }
+}
+
+async function applyProfileToAllPeers() {
+    for (const pc of rtcPeers.values()) {
+        await applyProfileToSenders(pc);
+    }
+}
+
 async function connectWebRTC(targetUserId) {
     if (!socket || !socket.connected) return;
 
@@ -376,7 +571,9 @@ async function connectWebRTC(targetUserId) {
     try {
         pc._makingOffer = true;
         const offer = await pc.createOffer({ offerToReceiveAudio: true });
+        offer.sdp = applyAudioProfileToSdp(offer.sdp);
         await pc.setLocalDescription(offer);
+        await applyProfileToSenders(pc);
         socket.emit('p2p-offer', { targetUserId, offer: pc.localDescription });
         console.log(`[WebRTC] Offer sent to ${targetUserId} (polite=${pc._polite})`);
     } catch (err) {
@@ -421,7 +618,9 @@ async function handleIncomingOffer(fromUserId, offer) {
             await pc.setRemoteDescription(new RTCSessionDescription(offer));
         }
         const answer = await pc.createAnswer();
+        answer.sdp = applyAudioProfileToSdp(answer.sdp);
         await pc.setLocalDescription(answer);
+        await applyProfileToSenders(pc);
         socket.emit('p2p-answer', { targetUserId: fromUserId, answer: pc.localDescription });
         console.log(`[WebRTC] Answer sent to ${fromUserId}`);
         await flushPendingIce(fromUserId);
@@ -585,7 +784,13 @@ function connectToServer() {
     const password = (passwordInput?.value || '').trim();
 
     if (!username || !password) {
-        alert('Ingresa usuario y clave.');
+        showToast('Ingresa usuario y clave.', 'warn');
+        return;
+    }
+
+    if (!SERVER_URL) {
+        showToast('Configura primero la dirección del servidor.', 'warn');
+        serverUrlInput?.focus();
         return;
     }
 
@@ -626,13 +831,17 @@ function connectToServer() {
             lastRttMs = null;
             stopPingHeartbeat();
             closeAllPeerConnections();
+            // Si estabamos transmitiendo, cortar de verdad y soltar el microfono.
+            isRecording = false;
+            pttButton.classList.remove('recording');
+            releaseMicStream();
             updateAudioStats();
         });
 
         socket.on('connect_error', (error) => {
             console.error('Error de conexion:', error);
             updateConnectionStatus('disconnected');
-            alert('No se pudo conectar al servidor. Verifica que el servidor este corriendo.');
+            showToast('No se pudo conectar al servidor. Comprueba que este encendido.', 'error', 6000);
         });
 
         socket.on('pong', () => {
@@ -655,8 +864,17 @@ function connectToServer() {
             pttButton.disabled = false;
         });
 
+        // El mismo usuario ha entrado desde otro dispositivo: el servidor cierra
+        // esta sesion para que no queden dos conexiones con el mismo nombre.
+        socket.on('session-replaced', (data) => {
+            showToast(data?.message || 'Has iniciado sesion en otro dispositivo.', 'warn', 8000);
+            authPanel.style.display = 'block';
+            mainPanel.style.display = 'none';
+            pttButton.disabled = true;
+        });
+
         socket.on('auth-error', (data) => {
-            alert(data?.message || 'Credenciales invalidas');
+            showToast(data?.message || 'Credenciales invalidas', 'error');
             if (socket) socket.disconnect();
             authPanel.style.display = 'block';
             mainPanel.style.display = 'none';
@@ -758,19 +976,21 @@ function registerUser() {
     const password = (passwordInput?.value || '').trim();
 
     if (!username || !password) {
-        alert('Ingresa usuario y clave para registrarte.');
+        showToast('Ingresa usuario y clave para registrarte.', 'warn');
         return;
     }
 
     if (!/^[a-zA-Z0-9_.-]{3,20}$/.test(username)) {
-        alert('Usuario invalido. Usa 3-20 caracteres: letras, numeros, . _ -');
+        showToast('Usuario invalido. Usa 3-20 caracteres: letras, numeros, . _ -', 'warn', 5000);
         return;
     }
 
     if (password.length < 4) {
-        alert('La clave debe tener al menos 4 caracteres.');
+        showToast('La clave debe tener al menos 4 caracteres.', 'warn');
         return;
     }
+
+    const inviteCode = (inviteCodeInput?.value || '').trim();
 
     const registerSocket = io(SERVER_URL, {
         transports: ['websocket'],
@@ -778,32 +998,40 @@ function registerUser() {
         timeout: 5000
     });
 
+    // Si el servidor no contesta, no dejar el socket colgando.
+    const registerTimeout = setTimeout(() => {
+        showToast('El servidor no respondio al registro.', 'error');
+        cleanup();
+    }, 8000);
+
     let resolved = false;
     const cleanup = () => {
         if (resolved) return;
         resolved = true;
+        clearTimeout(registerTimeout);
         registerSocket.disconnect();
     };
 
     registerSocket.on('connect', () => {
         registerSocket.emit('register-user', {
             userId: username,
-            password
+            password,
+            code: inviteCode
         });
     });
 
     registerSocket.on('register-success', (data) => {
-        alert(data?.message || 'Usuario creado.');
+        showToast(data?.message || 'Usuario creado.', 'ok');
         cleanup();
     });
 
     registerSocket.on('register-error', (data) => {
-        alert(data?.message || 'No se pudo registrar.');
+        showToast(data?.message || 'No se pudo registrar.', 'error');
         cleanup();
     });
 
     registerSocket.on('connect_error', () => {
-        alert('No se pudo conectar para registrar.');
+        showToast('No se pudo conectar para registrar.', 'error');
         cleanup();
     });
 }
@@ -877,49 +1105,84 @@ function applyConnLabelToItem(userItem, user) {
 
 function refreshConnLabels() {
     selectedContacts.forEach((user) => {
-        const userItem = document.getElementById(`user-${user}`);
+        const userItem = userItems.get(user);
         applyConnLabelToItem(userItem, user);
     });
     updatePttButtonState();
 }
 
 function updateUsersList() {
-    usersList.innerHTML = '';
     userCount.textContent = usersInChannel.length;
     const availableUsers = new Set(usersInChannel);
 
     Array.from(selectedContacts).forEach((user) => {
         if (!availableUsers.has(user)) {
             selectedContacts.delete(user);
+            // Se fue del canal: cerrar su conexion o quedaba una RTCPeerConnection
+            // y un elemento <audio> vivos por cada persona que se desconectaba.
+            closePeerConnection(user);
         }
     });
 
-    usersInChannel.forEach(user => {
-        const userItem = document.createElement('div');
-        userItem.className = 'user-item';
-        userItem.id = `user-${user}`;
+    // Se reconcilia la lista en vez de vaciarla y volver a crearla: al reconstruir
+    // el DOM entero se perdia el indicador "HABLANDO" de quien estuviera hablando
+    // justo en ese momento, y se recreaban todos los listeners.
+    for (const [user, item] of Array.from(userItems.entries())) {
+        if (!availableUsers.has(user)) {
+            item.remove();
+            userItems.delete(user);
+            talkingUsers.delete(user);
+        }
+    }
 
-        userItem.innerHTML = `
-            <span class="user-name">${user}</span>
-            <span class="talking-indicator" style="display: none;">🔴 HABLANDO</span>
-            <span class="selected-indicator" style="display: none;">✓ SELECCIONADO</span>
-        `;
+    usersInChannel.forEach((user) => {
+        let userItem = userItems.get(user);
 
-        if (user === currentUser) {
-            userItem.classList.add('self');
+        if (!userItem) {
+            userItem = document.createElement('div');
+            userItem.className = 'user-item';
+            // El nombre va en dataset, no en el id: un id construido con texto de
+            // otro usuario rompe los selectores y se serializa sin escapar.
+            userItem.dataset.user = user;
+
+            // textContent y no innerHTML: el nombre viene de otro usuario.
+            const nameEl = document.createElement('span');
+            nameEl.className = 'user-name';
+            nameEl.textContent = user;
+
+            const talkingEl = document.createElement('span');
+            talkingEl.className = 'talking-indicator';
+            talkingEl.textContent = '🔴 HABLANDO';
+            talkingEl.style.display = 'none';
+
+            const selectedEl = document.createElement('span');
+            selectedEl.className = 'selected-indicator';
+            selectedEl.textContent = '✓ SELECCIONADO';
+            selectedEl.style.display = 'none';
+
+            userItem.append(nameEl, talkingEl, selectedEl);
+
+            if (user === currentUser) {
+                userItem.classList.add('self');
+            } else {
+                userItem.style.cursor = 'pointer';
+                userItem.addEventListener('click', () => selectContact(user, userItem));
+            }
+
+            userItems.set(user, userItem);
         }
 
-        if (user !== currentUser) {
-            userItem.style.cursor = 'pointer';
-            userItem.addEventListener('click', () => selectContact(user, userItem));
-        }
+        const isSelected = selectedContacts.has(user);
+        userItem.classList.toggle('selected', isSelected);
+        userItem.querySelector('.selected-indicator').style.display = isSelected ? 'inline' : 'none';
 
-        if (selectedContacts.has(user)) {
-            userItem.classList.add('selected');
-            userItem.querySelector('.selected-indicator').style.display = 'inline';
-            applyConnLabelToItem(userItem, user);
-        }
+        const isTalking = talkingUsers.has(user);
+        userItem.classList.toggle('talking', isTalking);
+        userItem.querySelector('.talking-indicator').style.display = isTalking ? 'inline' : 'none';
 
+        if (isSelected) applyConnLabelToItem(userItem, user);
+
+        // append mueve el elemento si ya estaba: mantiene el orden del servidor.
         usersList.appendChild(userItem);
     });
 
@@ -938,23 +1201,41 @@ function updatePttButtonState() {
 
     if (selectedContacts.size === 0) {
         pttButton.disabled = true;
-        if (pttHint) pttHint.innerHTML = 'Selecciona un contacto para hablar';
+        if (pttHint) pttHint.textContent = 'Selecciona un contacto para hablar';
         return;
     }
 
-    const ready = anySelectedReady();
-    pttButton.disabled = !ready;
+    // El boton ya NO se bloquea cuando P2P no esta listo. Si la conexion directa
+    // no llega a establecerse (firewall, NAT simetrico, redes distintas), el
+    // mensaje se envia igualmente por el servidor al soltar el boton. Antes, en
+    // esas redes el walkie se quedaba mudo sin posibilidad de hablar.
+    pttButton.disabled = false;
 
-    if (pttHint) {
-        const contacts = Array.from(selectedContacts);
-        const preview = contacts.slice(0, 3).join(', ');
-        const extra = contacts.length > 3 ? ` +${contacts.length - 3}` : '';
-        if (ready) {
-            pttHint.innerHTML = `<strong>${preview}${extra}</strong><br>Mantener presionado para hablar`;
-        } else {
-            pttHint.innerHTML = `<strong>${preview}${extra}</strong><br><span style="color:#f1bf48">Conectando P2P, espera unos segundos...</span>`;
-        }
+    if (!pttHint) return;
+
+    const contacts = Array.from(selectedContacts);
+    const preview = contacts.slice(0, 3).join(', ');
+    const extra = contacts.length > 3 ? ` +${contacts.length - 3}` : '';
+
+    const listos = contacts.filter((u) => getPeerReadiness(u) === 'ready').length;
+
+    pttHint.textContent = '';
+    const quien = document.createElement('strong');
+    quien.textContent = `${preview}${extra}`;
+    pttHint.appendChild(quien);
+    pttHint.appendChild(document.createElement('br'));
+
+    const modo = document.createElement('span');
+    if (listos === contacts.length) {
+        modo.textContent = 'Mantener presionado para hablar (voz en directo)';
+    } else if (listos > 0) {
+        modo.style.color = '#f1bf48';
+        modo.textContent = `En directo con ${listos} de ${contacts.length}; al resto le llegara al soltar`;
+    } else {
+        modo.style.color = '#f1bf48';
+        modo.textContent = 'Conectando... mientras tanto, el mensaje se envia al soltar';
     }
+    pttHint.appendChild(modo);
 }
 
 /**
@@ -988,17 +1269,19 @@ function selectContact(contactName, contactElement) {
  * Actualizar indicador de quién está hablando
  */
 function updateUserTalking(userId, isTalking) {
-    const userElement = document.getElementById(`user-${userId}`);
-    if (userElement) {
-        const indicator = userElement.querySelector('.talking-indicator');
-        if (isTalking) {
-            userElement.classList.add('talking');
-            indicator.style.display = 'inline';
-        } else {
-            userElement.classList.remove('talking');
-            indicator.style.display = 'none';
-        }
+    // Se recuerda quien habla para poder repintarlo si la lista se rehace.
+    if (isTalking) {
+        talkingUsers.add(userId);
+    } else {
+        talkingUsers.delete(userId);
     }
+
+    const userElement = userItems.get(userId);
+    if (!userElement) return;
+
+    const indicator = userElement.querySelector('.talking-indicator');
+    userElement.classList.toggle('talking', !!isTalking);
+    if (indicator) indicator.style.display = isTalking ? 'inline' : 'none';
 }
 
 /**
@@ -1007,34 +1290,71 @@ function updateUserTalking(userId, isTalking) {
 function addHistoryMessage(type, content) {
     const historyItem = document.createElement('div');
     historyItem.className = 'history-item';
-    
+
     const timestamp = new Date().toLocaleTimeString();
-    
+
+    const makeBadge = (text, extraClass) => {
+        const badge = document.createElement('span');
+        badge.className = `user-badge ${extraClass}`;
+        badge.textContent = text;
+        return badge;
+    };
+
+    const makeTime = () => {
+        const time = document.createElement('span');
+        time.className = 'timestamp';
+        time.textContent = timestamp;
+        return time;
+    };
+
     if (type === 'system') {
-        historyItem.innerHTML = `
-            <span class="user-badge user-badge-system">SISTEMA</span>
-            <span>${content}</span>
-            <span class="timestamp">${timestamp}</span>
-        `;
+        const text = document.createElement('span');
+        text.textContent = content;
+        historyItem.append(makeBadge('SISTEMA', 'user-badge-system'), text, makeTime());
     } else if (type === 'audio') {
-        historyItem.innerHTML = `
-            <span class="user-badge user-badge-user">${content.user}</span>
-            <span>🎤 Mensaje de voz</span>
-            <button class="btn-small play-btn" data-audio="${content.audioData}" data-mime="${content.mimeType || 'audio/webm'}">PLAY</button>
-            <span class="timestamp">${timestamp}</span>
-        `;
-        
-        // Agregar evento al botón de reproducir
-        const playBtn = historyItem.querySelector('.play-btn');
-        playBtn.addEventListener('click', () => playAudio(content.audioData, content.mimeType));
+        const label = document.createElement('span');
+        label.textContent = '🎤 Mensaje de voz';
+
+        // El audio se guarda en un Map, no en un atributo data-*: antes cada clip
+        // metia su base64 completo en el HTML (varios MB con 20 mensajes) y ademas
+        // quedaba duplicado en memoria.
+        const clipId = `clip-${++historyClipCounter}`;
+        historyClips.set(clipId, {
+            audioData: content.audioData,
+            mimeType: content.mimeType || 'audio/webm'
+        });
+
+        const playBtn = document.createElement('button');
+        playBtn.className = 'btn-small play-btn';
+        playBtn.textContent = 'PLAY';
+        playBtn.dataset.clipId = clipId;
+        playBtn.addEventListener('click', () => {
+            const clip = historyClips.get(clipId);
+            if (clip) playAudio(clip.audioData, clip.mimeType);
+        });
+
+        historyItem.append(
+            makeBadge(content.user, 'user-badge-user'),
+            label,
+            playBtn,
+            makeTime()
+        );
+        historyItem.dataset.clipId = clipId;
     }
-    
+
     historyList.prepend(historyItem);
-    
-    // Limitar historial a 20 mensajes
-    if (historyList.children.length > 20) {
-        historyList.removeChild(historyList.lastChild);
+
+    // Limitar historial a 20 mensajes (y soltar el audio de los que salen).
+    while (historyList.children.length > HISTORY_LIMIT) {
+        const removed = historyList.lastChild;
+        if (removed?.dataset?.clipId) historyClips.delete(removed.dataset.clipId);
+        historyList.removeChild(removed);
     }
+}
+
+function clearHistory() {
+    historyList.innerHTML = '';
+    historyClips.clear();
 }
 
 // ========== FUNCIONES DE AUDIO ==========
@@ -1046,7 +1366,7 @@ async function startRecording() {
     if (isRecording) return;
 
     if (!socket || !socket.connected) {
-        alert('No conectado al servidor');
+        showToast('No estas conectado al servidor.', 'error');
         return;
     }
 
@@ -1146,7 +1466,7 @@ async function startRecording() {
         });
     } catch (error) {
         console.error('Error al acceder al microfono:', error);
-        alert('No se pudo acceder al microfono. Verifica los permisos.');
+        showToast('No se pudo acceder al microfono. Revisa los permisos del navegador.', 'error', 6000);
     }
 }
 
@@ -1172,220 +1492,17 @@ function stopRecording() {
     });
 }
 
-// No cerramos el stream aqui; se mantiene vivo para WebRTC.
-// Solo se cierra al desconectarse del servidor.
-function closeCurrentStream() {
-}
-
 /**
- * Genera audio final WAV para historial
+ * Libera el microfono. Se llama al desconectar y tambien al perder la conexion:
+ * antes solo se hacia con el boton "Desconectar", asi que si se caia el servidor
+ * el indicador de microfono del navegador (o del movil) se quedaba encendido.
  */
-function finalizeCurrentRecording(transmissionId) {
-    // Mantener la firma por compatibilidad, pero el historial ahora se genera
-    // desde MediaRecorder.onstop usando blobs (ver startRecording).
-}
-/**
- * Inicia captura PCM en vivo para baja latencia.
- */
-function startPcmLiveCapture(stream, transmissionId) {
-    if (!AudioContextClass || !stream) return;
-
-    stopPcmLiveCapture();
-
-    try {
-        captureAudioContext = new AudioContextClass();
-        if (captureAudioContext.state === 'suspended') {
-            captureAudioContext.resume().catch(() => {});
-        }
-
-        captureSourceNode = captureAudioContext.createMediaStreamSource(stream);
-        captureProcessorNode = captureAudioContext.createScriptProcessor(LIVE_PCM_BUFFER_SIZE, 1, 1);
-        captureSilenceGainNode = captureAudioContext.createGain();
-        captureSilenceGainNode.gain.value = 0;
-
-        captureProcessorNode.onaudioprocess = (event) => {
-            if (!isRecording || !socket || !socket.connected) return;
-            
-            // No enviar audio si no hay contacto seleccionado
-            if (selectedContacts.size === 0) return;
-
-            const input = event.inputBuffer.getChannelData(0);
-            recordingSampleRate = captureAudioContext.sampleRate || LIVE_PCM_RATE;
-            recordingPcmChunks.push(float32ToInt16(input));
-
-            // Si el modo PCM en vivo esta desactivado, solo acumulamos para historial.
-            if (!ENABLE_PCM_LIVE_STREAMING) {
-                return;
-            }
-
-            const downsampled = downsampleBuffer(input, captureAudioContext.sampleRate, runtimePcmRate);
-            if (!downsampled || downsampled.length === 0) return;
-
-            const pcm16 = float32ToInt16(downsampled);
-            // Agrupar varios bloques para reducir overhead y ser menos sensible al jitter.
-            pcmSendBuffer.push(pcm16);
-            pcmSendBufferSamples += pcm16.length;
-            const targetSamples = Math.round(runtimePcmRate * (PCM_TARGET_PACKET_MS / 1000));
-            if (pcmSendBufferSamples < targetSamples) {
-                return;
-            }
-
-            // En tiempo real no conviene saltar frames: evita huecos por descarte.
-            const now = Date.now();
-            if (SEND_THROTTLE_MS > 0 && (now - lastSendTime) < SEND_THROTTLE_MS) {
-                // Dejamos acumulado el buffer y enviaremos en el siguiente callback.
-                return;
-            }
-            lastSendTime = now;
-
-            const combined = concatInt16Chunks(pcmSendBuffer);
-            pcmSendBuffer = [];
-            pcmSendBufferSamples = 0;
-
-            // Sin compresión para menor overhead; sin volatile para evitar recortes de paquetes.
-            const targetUsers = Array.from(selectedContacts);
-            socket.compress(false).emit('audio-stream', {
-                channel: currentChannel,
-                targetUsers,
-                audioData: combined.buffer,
-                mode: 'pcm-live',
-                format: 'pcm16',
-                sampleRate: runtimePcmRate,
-                transmissionId
-            });
-        };
-
-        // Conectar al destino en silencio para asegurar callbacks estables en todos los navegadores.
-        captureSourceNode.connect(captureProcessorNode);
-        captureProcessorNode.connect(captureSilenceGainNode);
-        captureSilenceGainNode.connect(captureAudioContext.destination);
-    } catch (err) {
-        console.error('Error iniciando audio en vivo PCM:', err);
-        stopPcmLiveCapture();
-    }
-}
-
-function stopPcmLiveCapture() {
-    try {
-        if (captureProcessorNode) {
-            captureProcessorNode.onaudioprocess = null;
-            captureProcessorNode.disconnect();
-        }
-        if (captureSourceNode) {
-            captureSourceNode.disconnect();
-        }
-        if (captureSilenceGainNode) {
-            captureSilenceGainNode.disconnect();
-        }
-        if (captureAudioContext && captureAudioContext.state !== 'closed') {
-            captureAudioContext.close().catch(() => {});
-        }
-    } catch (err) {
-        console.error('Error cerrando captura PCM:', err);
-    } finally {
-        captureProcessorNode = null;
-        captureSourceNode = null;
-        captureSilenceGainNode = null;
-        captureAudioContext = null;
-        pcmSendBuffer = [];
-        pcmSendBufferSamples = 0;
-    }
-}
-
-function downsampleBuffer(buffer, inputSampleRate, outputSampleRate) {
-    if (!buffer || outputSampleRate >= inputSampleRate) {
-        return buffer ? buffer.slice(0) : new Float32Array(0);
-    }
-
-    const sampleRateRatio = inputSampleRate / outputSampleRate;
-    const newLength = Math.round(buffer.length / sampleRateRatio);
-    const result = new Float32Array(newLength);
-    let offsetResult = 0;
-    let offsetBuffer = 0;
-
-    while (offsetResult < result.length) {
-        const nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio);
-        let accum = 0;
-        let count = 0;
-
-        for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
-            accum += buffer[i];
-            count++;
-        }
-
-        result[offsetResult] = count > 0 ? accum / count : 0;
-        offsetResult++;
-        offsetBuffer = nextOffsetBuffer;
-    }
-
-    return result;
-}
-
-function float32ToInt16(floatBuffer) {
-    const int16 = new Int16Array(floatBuffer.length);
-    for (let i = 0; i < floatBuffer.length; i++) {
-        const s = Math.max(-1, Math.min(1, floatBuffer[i]));
-        int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-    }
-    return int16;
-}
-function concatInt16Chunks(chunks) {
-    const totalLength = chunks.reduce((acc, chunk) => acc + chunk.length, 0);
-    const result = new Int16Array(totalLength);
-    let offset = 0;
-
-    chunks.forEach((chunk) => {
-        result.set(chunk, offset);
-        offset += chunk.length;
+function releaseMicStream() {
+    if (!currentStream) return;
+    currentStream.getTracks().forEach((track) => {
+        try { track.stop(); } catch (_) {}
     });
-
-    return result;
-}
-
-function downsampleInt16Buffer(int16Buffer, inputSampleRate, outputSampleRate) {
-    if (!int16Buffer || outputSampleRate >= inputSampleRate) {
-        return int16Buffer;
-    }
-
-    const floatInput = int16ToFloat32(int16Buffer);
-    const floatDownsampled = downsampleBuffer(floatInput, inputSampleRate, outputSampleRate);
-    return float32ToInt16(floatDownsampled);
-}
-
-function pcm16ToWavBuffer(pcm16, sampleRate) {
-    const bytesPerSample = 2;
-    const blockAlign = bytesPerSample;
-    const byteRate = sampleRate * blockAlign;
-    const dataSize = pcm16.length * bytesPerSample;
-    const buffer = new ArrayBuffer(44 + dataSize);
-    const view = new DataView(buffer);
-
-    writeAscii(view, 0, 'RIFF');
-    view.setUint32(4, 36 + dataSize, true);
-    writeAscii(view, 8, 'WAVE');
-    writeAscii(view, 12, 'fmt ');
-    view.setUint32(16, 16, true);
-    view.setUint16(20, 1, true);
-    view.setUint16(22, 1, true);
-    view.setUint32(24, sampleRate, true);
-    view.setUint32(28, byteRate, true);
-    view.setUint16(32, blockAlign, true);
-    view.setUint16(34, 16, true);
-    writeAscii(view, 36, 'data');
-    view.setUint32(40, dataSize, true);
-
-    let offset = 44;
-    for (let i = 0; i < pcm16.length; i++, offset += 2) {
-        view.setInt16(offset, pcm16[i], true);
-    }
-
-    return buffer;
-}
-
-function writeAscii(view, offset, text) {
-    for (let i = 0; i < text.length; i++) {
-        view.setUint8(offset + i, text.charCodeAt(i));
-    }
+    currentStream = null;
 }
 
 function arrayBufferToBase64(buffer) {
@@ -1398,150 +1515,6 @@ function arrayBufferToBase64(buffer) {
     }
 
     return btoa(binary);
-}
-
-function blobToBase64(blob) {
-    return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onloadend = () => {
-            const result = reader.result;
-            if (typeof result === 'string') {
-                const commaIndex = result.indexOf(',');
-                resolve(commaIndex >= 0 ? result.slice(commaIndex + 1) : result);
-            } else {
-                resolve('');
-            }
-        };
-        reader.onerror = reject;
-        reader.readAsDataURL(blob);
-    });
-}
-
-function base64ToInt16(base64Data) {
-    const binary = atob(base64Data);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) {
-        bytes[i] = binary.charCodeAt(i);
-    }
-    return new Int16Array(bytes.buffer);
-}
-
-function payloadToInt16(payload) {
-    if (!payload) return new Int16Array(0);
-
-    if (typeof payload === 'string') {
-        return base64ToInt16(payload);
-    }
-
-    if (payload instanceof ArrayBuffer) {
-        return new Int16Array(payload);
-    }
-
-    if (ArrayBuffer.isView(payload)) {
-        return new Int16Array(payload.buffer, payload.byteOffset, Math.floor(payload.byteLength / 2));
-    }
-
-    // Compatibilidad si llega serializado como Buffer de Node.
-    if (payload.type === 'Buffer' && Array.isArray(payload.data)) {
-        return new Int16Array(new Uint8Array(payload.data).buffer);
-    }
-
-    return new Int16Array(0);
-}
-
-function int16ToFloat32(int16Buffer) {
-    const float32 = new Float32Array(int16Buffer.length);
-    for (let i = 0; i < int16Buffer.length; i++) {
-        float32[i] = int16Buffer[i] / 0x8000;
-    }
-    return float32;
-}
-
-
-function clampNumber(value, min, max) {
-    return Math.max(min, Math.min(max, value));
-}
-
-function getAdaptivePlaybackLead(now, chunkDuration) {
-    if (playbackLastArrivalTime > 0) {
-        const interArrival = now - playbackLastArrivalTime;
-        const expected = Math.max(0.001, chunkDuration || 0.04);
-        const delta = Math.abs(interArrival - expected);
-        playbackInterArrivalJitter = (playbackInterArrivalJitter * 0.95) + (delta * 0.05);
-    }
-    playbackLastArrivalTime = now;
-
-    const adaptiveLead = runtimeBaseLeadSeconds + (playbackInterArrivalJitter * ADAPTIVE_JITTER_GAIN);
-    return clampNumber(adaptiveLead, runtimeMinLeadSeconds, runtimeMaxLeadSeconds);
-}
-function playPcmChunk(base64Pcm, sampleRate, transmissionId) {
-    if (!AudioContextClass) return;
-
-    try {
-        if (!playbackAudioContext) {
-            playbackAudioContext = new AudioContextClass();
-        }
-
-        if (playbackAudioContext.state === 'suspended') {
-            playbackAudioContext.resume().catch(() => {});
-        }
-
-        const pcm16 = payloadToInt16(base64Pcm);
-        if (!pcm16 || pcm16.length === 0) return;
-
-        const pcmFloat = int16ToFloat32(pcm16);
-        const buffer = playbackAudioContext.createBuffer(1, pcmFloat.length, sampleRate || runtimePcmRate);
-        buffer.copyToChannel(pcmFloat, 0, 0);
-
-        const source = playbackAudioContext.createBufferSource();
-        const gainNode = playbackAudioContext.createGain();
-        source.buffer = buffer;
-        source.connect(gainNode);
-        gainNode.connect(playbackAudioContext.destination);
-
-        const now = playbackAudioContext.currentTime;
-        const adaptiveLead = getAdaptivePlaybackLead(now, buffer.duration);
-        lastAdaptiveLeadSeconds = adaptiveLead;
-        const minStart = now + adaptiveLead;
-        if (playbackNextTime < minStart) {
-            playbackNextTime = minStart;
-        }
-
-        const currentQueue = playbackNextTime - now;
-        lastPlaybackQueueSeconds = currentQueue;
-        if (currentQueue > runtimeMaxQueueSeconds) {
-            // Evita saltos bruscos: recorta de forma gradual y proporcional el exceso de cola.
-            const excess = currentQueue - runtimeMaxQueueSeconds;
-            const trimAmount = Math.min(excess * 0.5, runtimeQueueTrimSeconds);
-            playbackNextTime = Math.max(minStart, playbackNextTime - trimAmount);
-        }
-
-        const startAt = playbackNextTime;
-        const endAt = startAt + buffer.duration;
-        const fadeTime = Math.min(CHUNK_FADE_SECONDS, buffer.duration / 2);
-
-        // Rampa corta para evitar clics entre chunks.
-        gainNode.gain.setValueAtTime(0, startAt);
-        gainNode.gain.linearRampToValueAtTime(1, startAt + fadeTime);
-        gainNode.gain.setValueAtTime(1, Math.max(startAt + fadeTime, endAt - fadeTime));
-        gainNode.gain.linearRampToValueAtTime(0, endAt);
-
-        source.start(startAt);
-        playbackNextTime = startAt + buffer.duration;
-        updateAudioStats();
-        // Diagnostico ligero en consola cada cierto numero de chunks.
-        debugPcmChunkCounter++;
-        if (debugPcmChunkCounter % 25 === 0) {
-            console.debug(
-                '[AudioLive] jitter=%sms, cola=%sms, lead=%sms',
-                Math.round((playbackInterArrivalJitter || 0) * 1000),
-                Math.round((lastPlaybackQueueSeconds || 0) * 1000),
-                Math.round((lastAdaptiveLeadSeconds || 0) * 1000)
-            );
-        }
-    } catch (err) {
-        console.error('Error reproduciendo chunk PCM:', err);
-    }
 }
 
 /**
@@ -1573,95 +1546,6 @@ function playAudioClip(audioData, mimeType = 'audio/webm', onDone) {
     }
 }
 
-/**
- * Cola de reproducción para chunks en vivo (usado por modo 'full' legacy).
- */
-function enqueueLiveAudio(audioData, mimeType = 'audio/webm') {
-    liveAudioQueue.push({ audioData, mimeType });
-    if (!isPlayingLiveAudio) {
-        playNextLiveAudio();
-    }
-}
-
-function playNextLiveAudio() {
-    if (liveAudioQueue.length === 0) {
-        isPlayingLiveAudio = false;
-        return;
-    }
-
-    isPlayingLiveAudio = true;
-    const nextChunk = liveAudioQueue.shift();
-    playAudioClip(nextChunk.audioData, nextChunk.mimeType, playNextLiveAudio);
-}
-
-/**
- * MediaSource Extensions: reproduce WebM en vivo mientras llegan chunks.
- * Los fragmentos de MediaRecorder no son archivos independientes; hay que
- * concatenarlos en un stream y reproducir con MSE.
- */
-function appendLiveChunkMSE(base64Audio, mimeType, transmissionId) {
-    if (!window.MediaSource) {
-        enqueueLiveAudio(base64Audio, mimeType);
-        return;
-    }
-    if (!base64Audio || typeof base64Audio !== 'string') return;
-
-    const mime = mimeType || 'audio/webm';
-    const buffer = base64ToArrayBuffer(base64Audio);
-    if (!buffer || buffer.byteLength === 0) return;
-
-    const isNewTransmission = transmissionId && transmissionId !== liveTransmissionId;
-    const needReinit = !liveMediaSource || liveMediaSource.readyState === 'ended' || isNewTransmission;
-
-    if (needReinit && liveMediaSource) {
-        clearLiveMSE();
-    }
-
-    liveTransmissionId = transmissionId || liveTransmissionId;
-    liveMSEChunkQueue.push(buffer);
-
-    const tryAppendQueued = () => {
-        if (liveMSEChunkQueue.length === 0 || !liveSourceBuffer || liveSourceBuffer.updating) return;
-        const buf = liveMSEChunkQueue.shift();
-        try {
-            liveSourceBuffer.appendBuffer(buf);
-        } catch (e) {
-            console.error('Error appendBuffer:', e);
-        }
-    };
-
-    if (!liveMediaSource) {
-        liveMediaSource = new MediaSource();
-        liveAudioEl = document.createElement('audio');
-        liveAudioEl.autoplay = true;
-        document.body.appendChild(liveAudioEl);
-
-        liveMediaSource.addEventListener('sourceopen', () => {
-            try {
-                liveSourceBuffer = liveMediaSource.addSourceBuffer(mime);
-                liveSourceBuffer.addEventListener('updateend', tryAppendQueued);
-                tryAppendQueued();
-            } catch (e) {
-                console.error('Error creando SourceBuffer:', e);
-            }
-        });
-
-        liveAudioEl.src = URL.createObjectURL(liveMediaSource);
-        liveAudioEl.play().catch((e) => console.warn('Live audio play:', e));
-    } else if (liveSourceBuffer && !liveSourceBuffer.updating) {
-        tryAppendQueued();
-    }
-
-    if (liveMSEEndTimeout) clearTimeout(liveMSEEndTimeout);
-    liveMSEEndTimeout = setTimeout(() => {
-        if (liveMediaSource && liveMediaSource.readyState === 'open') {
-            try {
-                liveMediaSource.endOfStream();
-            } catch (e) {}
-        }
-        liveMSEEndTimeout = null;
-    }, 600);
-}
 
 function base64ToArrayBuffer(base64) {
     let binary = '';
@@ -1677,27 +1561,6 @@ function base64ToArrayBuffer(base64) {
     return bytes.buffer;
 }
 
-function clearLiveMSE() {
-    if (liveMSEEndTimeout) {
-        clearTimeout(liveMSEEndTimeout);
-        liveMSEEndTimeout = null;
-    }
-    liveMSEChunkQueue = [];
-    if (liveAudioEl && liveAudioEl.src) {
-        URL.revokeObjectURL(liveAudioEl.src);
-        liveAudioEl.src = '';
-        liveAudioEl.remove();
-    }
-    liveAudioEl = null;
-    liveSourceBuffer = null;
-    if (liveMediaSource) {
-        try {
-            if (liveMediaSource.readyState === 'open') liveMediaSource.endOfStream();
-        } catch (e) {}
-        liveMediaSource = null;
-    }
-    liveTransmissionId = null;
-}
 
 /**
  * Reproducir audio desde historial
@@ -1713,7 +1576,22 @@ connectBtn.addEventListener('click', connectToServer);
 if (registerBtn) {
     registerBtn.addEventListener('click', registerUser);
 }
-// Perfiles de audio ya no aplican (WebRTC maneja su propio codec).
+// Perfil de audio: ajusta el bitrate y el empaquetado de Opus en caliente.
+if (audioProfileSelect) {
+    currentAudioProfile = audioProfileSelect.value || 'balanced';
+    if (audioProfileHelp) audioProfileHelp.textContent = getAudioProfile().label;
+
+    audioProfileSelect.addEventListener('change', async () => {
+        currentAudioProfile = audioProfileSelect.value;
+        const profile = getAudioProfile();
+        if (audioProfileHelp) audioProfileHelp.textContent = profile.label;
+
+        // El bitrate se puede cambiar sin renegociar la sesion.
+        await applyProfileToAllPeers();
+        showToast(`Perfil de audio: ${profile.label}`, 'info', 2500);
+        updateAudioStats();
+    });
+}
 
 // Permitir Enter en el input
 usernameInput.addEventListener('keypress', (e) => {
@@ -1728,18 +1606,18 @@ if (passwordInput) {
 // Botón desconectar
 disconnectBtn.addEventListener('click', () => {
     closeAllPeerConnections();
-    if (currentStream) {
-        currentStream.getTracks().forEach(t => t.stop());
-        currentStream = null;
-    }
+    releaseMicStream();
     if (socket) {
         socket.disconnect();
         authPanel.style.display = 'block';
         mainPanel.style.display = 'none';
         usersInChannel = [];
         selectedContacts.clear();
+        userItems.forEach((item) => item.remove());
+        userItems.clear();
+        talkingUsers.clear();
         updatePttButtonState();
-        historyList.innerHTML = '';
+        clearHistory();
     }
     stopPingHeartbeat();
 });
@@ -1751,7 +1629,7 @@ function beginPtt(e) {
     
     // Verificar que hay un contacto seleccionado
     if (selectedContacts.size === 0) {
-        alert('⚠️ Selecciona un contacto primero');
+        showToast('Selecciona un contacto primero.', 'warn');
         return;
     }
     
@@ -1766,9 +1644,13 @@ function endPtt(e) {
 }
 
 pttButton.addEventListener('pointerdown', (e) => {
-    if (typeof pttButton.setPointerCapture === 'function') {
-        pttButton.setPointerCapture(e.pointerId);
-    }
+    // setPointerCapture puede lanzar (NotFoundError) segun el navegador y el tipo
+    // de puntero. Si eso ocurriera aqui sin protegerlo, beginPtt no llegaria a
+    // ejecutarse y el boton se quedaria pulsado sin transmitir.
+    try {
+        pttButton.setPointerCapture?.(e.pointerId);
+    } catch (_) {}
+
     beginPtt(e);
 });
 
@@ -1821,20 +1703,79 @@ pttButton.addEventListener('contextmenu', (e) => e.preventDefault());
 
 updateAudioStats();
 
+// Carga la configuracion ICE antes de que haga falta la primera conexion.
+loadIceConfig();
+
+/**
+ * Ajusta la pantalla de acceso a como este configurado el servidor:
+ * oculta el boton de registro si esta cerrado y pide el codigo si hace falta.
+ */
+async function loadAppConfig() {
+    if (!SERVER_URL) return;
+    try {
+        const res = await fetch(`${SERVER_URL}/app-config`, { cache: 'no-store' });
+        if (!res.ok) return;
+        const cfg = await res.json();
+
+        if (registerBtn && cfg.allowRegistration === false) {
+            registerBtn.style.display = 'none';
+        }
+        if (inviteGroup && cfg.requiresInviteCode) {
+            inviteGroup.style.display = 'flex';
+        }
+    } catch (err) {
+        console.warn('No se pudo leer /app-config:', err.message);
+    }
+}
+
+/**
+ * Campo de direccion del servidor. Se muestra siempre en la app empaquetada
+ * (movil/escritorio) y tambien en la web si ya se habia guardado una direccion,
+ * para poder cambiarla sin reinstalar nada.
+ */
+function setupServerField() {
+    if (!serverGroup || !serverUrlInput) return;
+
+    const saved = getSavedServerUrl();
+    const necesitaServidor = isLocalPackage();
+
+    if (necesitaServidor || saved) {
+        serverGroup.style.display = 'block';
+        serverUrlInput.value = saved || '';
+    }
+
+    if (serverHint) {
+        serverHint.textContent = SERVER_URL
+            ? `Conectando a ${SERVER_URL}`
+            : 'Escribe la dirección del servidor para poder entrar.';
+    }
+
+    // Sin servidor no se puede ni intentar conectar.
+    if (!SERVER_URL && connectBtn) connectBtn.disabled = true;
+
+    const guardar = () => {
+        const url = normalizeServerUrl(serverUrlInput.value);
+        if (!url) {
+            showToast('Escribe la dirección del servidor.', 'warn');
+            return;
+        }
+        saveServerUrl(url);
+        SERVER_URL = url;
+        serverUrlInput.value = url;
+        if (serverHint) serverHint.textContent = `Conectando a ${url}`;
+        if (connectBtn) connectBtn.disabled = false;
+        showToast('Servidor guardado.', 'ok');
+        loadIceConfig();
+        loadAppConfig();
+    };
+
+    saveServerBtn?.addEventListener('click', guardar);
+    serverUrlInput.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') guardar();
+    });
+}
+
+setupServerField();
+loadAppConfig();
+
 console.log('App lista para usar (WebRTC)');
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

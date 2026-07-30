@@ -27,7 +27,9 @@
   "devDependencies": {
     "electron": "^37.3.1",
     "electron-builder": "^26.0.12",
+    "jsdom": "^30.0.1",
     "nodemon": "^3.0.1",
+    "socket.io-client": "^4.8.3",
     "vitest": "^4.1.4"
   },
   "build": {

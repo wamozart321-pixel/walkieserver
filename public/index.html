@@ -7,15 +7,25 @@
 
     <meta name="theme-color" content="#f6a31d">
     <meta name="description" content="Walkie Talkie multiplataforma - comunicacion instantanea">
-    <link rel="manifest" href="manifiest.json">
+    <link rel="manifest" href="manifest.json">
     <link rel="apple-touch-icon" href="iconlogo.png">
 
+    <!--
+      Las fuentes son un extra: si no hay internet, el navegador usa las de
+      respaldo definidas en styles.css y la aplicacion se ve igual de bien.
+    -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;800&family=Rajdhani:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="styles.css">
 
-    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+    <!--
+      Socket.IO va incluido en el proyecto, no se descarga de un CDN de internet.
+      Antes la aplicacion no arrancaba si se caia la conexion exterior, aunque el
+      servidor estuviera funcionando en la red local; y en la app de Android, que
+      carga los archivos desde el propio telefono, tampoco habria funcionado.
+    -->
+    <script src="vendor/socket.io.min.js"></script>
 </head>
 <body>
     <div class="container">
@@ -51,6 +61,21 @@
                 <button id="connectBtn" class="btn-primary">Entrar</button>
                 <button id="registerBtn" class="btn-secondary">Registrarse</button>
             </div>
+
+            <!-- Solo aparece si el servidor pide codigo de invitacion. -->
+            <div class="input-group invite-group" id="inviteGroup" style="display: none;">
+                <input type="text" id="inviteCodeInput" placeholder="Código de invitación" maxlength="60" autocomplete="off">
+            </div>
+
+            <!-- Dirección del servidor: necesaria en la app de móvil. -->
+            <div class="server-group" id="serverGroup" style="display: none;">
+                <label for="serverUrlInput">Dirección del servidor</label>
+                <div class="input-group">
+                    <input type="text" id="serverUrlInput" placeholder="192.168.0.10:3000" autocomplete="off" inputmode="url">
+                    <button id="saveServerBtn" class="btn-secondary">Guardar</button>
+                </div>
+                <p class="server-hint" id="serverHint"></p>
+            </div>
         </div>
 
         <div class="main-panel" id="mainPanel" style="display: none;">
@@ -79,6 +104,7 @@
                         <option value="low-latency">Baja latencia</option>
                     </select>
                 </div>
+                <div class="audio-profile-help" id="audioProfileHelp"></div>
             </section>
 
             <section class="users-section panel">
@@ -92,7 +118,7 @@
                     <span class="ptt-microphone">PTT</span>
                 </button>
                 <div class="ptt-hint">Mantener presionado para transmitir voz</div>
-                <div class="audio-stats" id="audioStats">Perfil: balanceado | RTT: -- | Jitter: -- | Cola: --</div>
+                <div class="audio-stats" id="audioStats">Conectando...</div>
             </section>
 
             <section class="history-section panel">

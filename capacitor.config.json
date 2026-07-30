@@ -3,7 +3,7 @@
   "appName": "WeasyTalkie",
   "webDir": "public",
   "server": {
-    "url": "https://TU-DOMINIO.onrender.com",
-    "cleartext": false
+    "androidScheme": "https",
+    "cleartext": true
   }
 }
