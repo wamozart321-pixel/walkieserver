@@ -7,8 +7,8 @@ android {
         applicationId "com.weasytalkie.app"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 4
-        versionName "1.3.0"
+        versionCode 5
+        versionName "1.4.0"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
@@ -16,7 +16,7 @@ android {
             ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
         }
     }
-    // Firma de publicación. Los datos se leen de keystore.properties, que queda
+    // Firma de publicaciÃ³n. Los datos se leen de keystore.properties, que queda
     // fuera del repositorio: si no existe, el APK de release sale sin firmar.
     signingConfigs {
         release {
@@ -74,3 +74,4 @@ try {
 } catch(Exception e) {
     logger.info("google-services.json not found, google-services plugin not applied. Push Notifications won't work")
 }
+

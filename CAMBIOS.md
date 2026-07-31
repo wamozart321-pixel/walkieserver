@@ -1,5 +1,30 @@
 # WeasyTalkie — notas de la revisión
 
+## Servicio en segundo plano de Android (1.4)
+
+Android suspende las aplicaciones a los pocos minutos de minimizarlas, y con
+ello se dejaban de recibir mensajes. La única forma admitida de evitarlo es un
+**servicio en primer plano**, y eso es lo que se ha añadido: código nativo
+(`WalkieForegroundService.java`) que muestra una notificación permanente
+—*"WeasyTalkie está escuchando"*— y mantiene el proceso vivo de forma indefinida.
+
+- El servicio se declara de tipo **micrófono**, obligatorio desde Android 14 para
+  poder seguir capturando voz con la aplicación minimizada.
+- Se arranca al entrar al canal y se detiene al desconectarse, así que no
+  consume batería cuando no estás usando la aplicación.
+- Al tocar la notificación se vuelve a la aplicación.
+- En Android 13 y posteriores se pide el permiso de notificaciones: sin la
+  notificación visible el sistema acabaría matando el servicio igualmente. Si se
+  deniega, la aplicación avisa de que el segundo plano quedará limitado.
+
+Se controla desde la web con un plugin propio de Capacitor
+(`BackgroundModePlugin.java`), que solo existe dentro de la aplicación de
+Android; en la web y en el escritorio no se usa.
+
+Verificado dentro del APK: `versionCode 5`, permisos `FOREGROUND_SERVICE`,
+`FOREGROUND_SERVICE_MICROPHONE`, `POST_NOTIFICATIONS` y `RECORD_AUDIO`, y el
+servicio declarado con `foregroundServiceType="microphone"`.
+
 ## Voz en tiempo real siempre (1.3)
 
 La conexión directa entre navegadores es la vía preferida, pero **no siempre se
@@ -27,11 +52,8 @@ conexión quedó establecida para el mensaje siguiente.
 | **Escritorio (.exe)** | Icono en la bandeja del sistema. Cerrar la ventana **no** cierra la aplicación: sigue recibiendo. Se sale con *Salir* en el icono. Además impide que Windows suspenda el equipo. |
 | **Web y Android** | Se pide *Wake Lock* (que la pantalla no se apague) y se mantiene una pista de audio en silencio: mientras hay audio activo, ni el navegador ni Android suspenden el proceso. |
 
-> En Android, con la aplicación minimizada, esto alarga bastante el tiempo que
-> sigue funcionando, pero **el sistema puede acabar suspendiéndola igualmente**.
-> Para que siga activa de forma indefinida haría falta un *foreground service*
-> nativo (código Java con una notificación permanente), que es el siguiente paso
-> si lo necesitas.
+> En Android, además de esto, funciona el **servicio en primer plano** descrito
+> arriba, que es lo que mantiene la aplicación activa de forma indefinida.
 
 ## Correcciones de la 1.2
 
@@ -69,8 +91,8 @@ publicada la web.
 
 | Archivo | Qué es |
 |---|---|
-| `installer/dist/WeasyTalkie_1.3.0_Setup.exe` (92 MB) | Aplicación de escritorio para Windows |
-| `installer/dist/WeasyTalkie_1.3.0.apk` (4 MB) | Aplicación para Android, **firmada para publicación** |
+| `installer/dist/WeasyTalkie_1.4.0_Setup.exe` (92 MB) | Aplicación de escritorio para Windows |
+| `installer/dist/WeasyTalkie_1.4.0.apk` (4 MB) | Aplicación para Android, **firmada para publicación** |
 
 **Escritorio (Windows).** Una ventana de Electron que abre la web; el audio va
 por WebRTC igual que en el navegador. Concede el permiso de micrófono sin

@@ -24,6 +24,14 @@
 
         </activity>
 
+        <!-- Servicio que mantiene la aplicación escuchando en segundo plano.
+             El tipo "microphone" es obligatorio desde Android 14 para poder
+             seguir capturando voz con la aplicación minimizada. -->
+        <service
+            android:name=".WalkieForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"
@@ -46,6 +54,15 @@
 
     <!-- WebRTC necesita conocer el estado de la red para negociar la conexión. -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- Servicio en primer plano: es lo que impide que Android suspenda la
+         aplicación a los pocos minutos de minimizarla. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+
+    <!-- Desde Android 13 la notificación permanente del servicio requiere
+         permiso; sin ella el sistema acaba matando el servicio. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!-- El micrófono es imprescindible, pero no se exige para poder instalar
          en equipos sin él (por ejemplo, algunas tabletas). -->

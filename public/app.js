@@ -342,8 +342,54 @@ function attachDataChannel(targetUserId, dc) {
 
 let wakeLock = null;
 let silencioContext = null;
+let servicioAndroidActivo = false;
+
+/** El plugin nativo solo existe dentro de la aplicación de Android. */
+function pluginSegundoPlano() {
+    return window.Capacitor?.Plugins?.BackgroundMode || null;
+}
+
+/**
+ * Arranca el servicio en primer plano de Android. Es lo unico que impide que el
+ * sistema suspenda la aplicacion al minimizarla: muestra una notificacion
+ * permanente ("WeasyTalkie esta escuchando") y mantiene el proceso vivo.
+ */
+async function iniciarServicioAndroid() {
+    const plugin = pluginSegundoPlano();
+    if (!plugin || servicioAndroidActivo) return;
+
+    try {
+        const r = await plugin.start();
+        servicioAndroidActivo = true;
+        console.log('[Segundo plano] Servicio de Android activo.', r);
+
+        if (r && r.notificaciones === false) {
+            showToast(
+                'Activa las notificaciones para que la app siga escuchando con la pantalla apagada.',
+                'warn', 7000);
+        }
+    } catch (err) {
+        console.warn('[Segundo plano] No se pudo iniciar el servicio:', err.message);
+    }
+}
+
+async function detenerServicioAndroid() {
+    const plugin = pluginSegundoPlano();
+    if (!plugin || !servicioAndroidActivo) return;
+
+    try {
+        await plugin.stop();
+    } catch (err) {
+        console.warn('[Segundo plano] No se pudo detener el servicio:', err.message);
+    } finally {
+        servicioAndroidActivo = false;
+    }
+}
 
 async function mantenerActivo() {
+    // 0. En Android, el servicio nativo es lo que de verdad mantiene la app viva.
+    iniciarServicioAndroid();
+
     // 1. Evitar que la pantalla se apague.
     try {
         if ('wakeLock' in navigator && !wakeLock) {
@@ -377,6 +423,8 @@ async function mantenerActivo() {
 }
 
 function dejarDeMantenerActivo() {
+    detenerServicioAndroid();
+
     try { wakeLock?.release(); } catch (_) {}
     wakeLock = null;
 

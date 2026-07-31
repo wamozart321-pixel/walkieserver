@@ -6,7 +6,7 @@
 ; WebRTC igual que en el navegador.
 
 #define AppName        "WeasyTalkie"
-#define AppVersion     "1.3.0"
+#define AppVersion     "1.4.0"
 #define AppPublisher   "WeasyTalkie"
 #define AppExe         "WeasyTalkie.exe"
 #define SourceDir      "..\dist-desktop\WeasyTalkie-win"
