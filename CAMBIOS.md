@@ -1,5 +1,72 @@
 # WeasyTalkie — notas de la revisión
 
+## Instaladores (1.1)
+
+Los dos apuntan a **https://weasytalkie.onrender.com**, que es donde está
+publicada la web.
+
+| Archivo | Qué es |
+|---|---|
+| `installer/dist/WeasyTalkie_1.1.0_Setup.exe` (92 MB) | Aplicación de escritorio para Windows |
+| `installer/dist/WeasyTalkie_1.1.0.apk` (5 MB) | Aplicación para Android |
+
+**Escritorio (Windows).** Una ventana de Electron que abre la web; el audio va
+por WebRTC igual que en el navegador. Concede el permiso de micrófono sin
+preguntar en cada arranque y se instala **por usuario, sin pedir administrador**.
+Para apuntar a otro servidor (por ejemplo el de la red local) basta con dejar un
+archivo `server.txt` junto al programa con la dirección dentro, sin recompilar.
+
+Se genera con:
+
+```
+npx electron-builder --win --dir            (o el montaje manual, ver abajo)
+"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\WeasyTalkie.iss
+```
+
+> `electron-builder` falla al crear el instalador en este equipo: al extraer sus
+> herramientas de firma intenta crear enlaces simbólicos de macOS y Windows lo
+> impide sin permisos de administrador. Por eso el `.exe` final se arma con Inno
+> Setup, que ya se usaba para la otra aplicación.
+
+**Android.** APK de depuración (firmado con la clave de depuración, se instala
+activando "orígenes desconocidos"). Se le añadieron los permisos que faltaban:
+`RECORD_AUDIO` y `MODIFY_AUDIO_SETTINGS` — **sin ellos la aplicación no podía
+usar el micrófono**, que es justo lo que hace un walkie-talkie.
+
+Se genera con:
+
+```
+npx cap sync android
+cd android && gradlew assembleDebug
+```
+
+> Requiere `JAVA_HOME` apuntando al JDK de Android Studio y `ANDROID_HOME` al SDK.
+> Como la carpeta del usuario lleva una "Ñ", hizo falta `android.overridePathCheck=true`
+> en `android/gradle.properties`: Gradle se niega a compilar en rutas no ASCII.
+>
+> Para publicarlo en Google Play haría falta un APK/AAB **firmado con tu propia
+> clave**; el de depuración sirve para instalarlo a mano en los móviles.
+
+## Entrada en servicio de las conexiones (1.1)
+
+Una conexión directa tarda entre uno y varios segundos en establecerse. Durante
+ese rato **el mensaje se envía igual**: al soltar el botón viaja el clip completo
+por el servidor (o por el canal de datos), así que nadie se queda sin recibirlo.
+En cuanto la conexión está lista, se pasa a voz en directo sin más.
+
+Lo que se ha corregido es **el momento del cambio**. Antes, si la conexión
+terminaba de negociarse justo mientras estabas hablando, el otro extremo
+empezaba a oírte por la mitad de la frase y además recibía el mensaje entero al
+soltar. Ahora:
+
+- Una conexión que se completa mientras hablas **no entra en servicio hasta que
+  sueltas el botón** (se le corta el envío con `replaceTrack(null)`, que actúa
+  sobre esa conexión concreta y no sobre el micrófono, que es común a todas).
+- Si seleccionas un contacto nuevo mientras hablas, **su conexión se aplaza** y
+  se lanza al terminar.
+- En la lista, ese contacto aparece como **"LISTO AL SOLTAR"** para que se vea
+  qué está pasando.
+
 ## Qué era "lo que se implementó" para arreglar el audio
 
 El código conserva el rastro de tres intentos:

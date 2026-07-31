@@ -40,11 +40,22 @@
     },
     "files": [
       "electron/**/*",
+      "public/icon-512.png",
       "package.json"
     ],
     "win": {
       "target": "nsis",
-      "icon": "public/iconlogo.png"
+      "icon": "public/icon-512.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "WeasyTalkie",
+      "installerLanguages": ["es_ES"],
+      "language": "3082"
     }
   }
 }

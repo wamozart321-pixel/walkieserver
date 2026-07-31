@@ -35,7 +35,19 @@
         </provider>
     </application>
 
-    <!-- Permissions -->
+    <!-- Permisos -->
 
     <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Sin RECORD_AUDIO la aplicación no puede usar el micrófono: el
+         walkie-talkie se quedaría mudo. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+
+    <!-- WebRTC necesita conocer el estado de la red para negociar la conexión. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- El micrófono es imprescindible, pero no se exige para poder instalar
+         en equipos sin él (por ejemplo, algunas tabletas). -->
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
 </manifest>

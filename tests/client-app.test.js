@@ -13,8 +13,14 @@ const PUENTE = `
 ;window.__t = {
   get contacts() { return selectedContacts; },
   get talking() { return talkingUsers; },
+  get esperando() { return peersEsperandoFinTx; },
+  get aplazadas() { return conexionesAplazadas; },
+  get peers() { return rtcPeers; },
   setUsers(u) { usersInChannel = u; },
-  setProfile(p) { currentAudioProfile = p; }
+  setProfile(p) { currentAudioProfile = p; },
+  setRecording(v) { isRecording = v; },
+  setStream(s) { currentStream = s; },
+  setSocket(s) { socket = s; }
 };`;
 
 function crearApp() {
@@ -168,6 +174,87 @@ describe('cliente web', () => {
       t.contacts.clear();
       window.updatePttButtonState();
       expect(doc.getElementById('pttButton').disabled).toBe(true);
+    });
+  });
+
+  describe('entrada en servicio de una conexion', () => {
+    // Simula una conexion P2P con su sender de audio.
+    function peerFalso(estado = 'connected') {
+        const pistas = [];
+        return {
+            connectionState: estado,
+            _audioSender: {
+                pista: 'inicial',
+                replaceTrack(t) { this.pista = t; pistas.push(t); return Promise.resolve(); }
+            },
+            get cambios() { return pistas; }
+        };
+    }
+
+    it('una conexion que se completa mientras hablas no entra en servicio', () => {
+      const { window, t } = crearApp();
+      const pc = peerFalso();
+
+      t.setRecording(true);
+      t.peers.set('luis', pc);
+      window.entrarEnServicio('luis', pc);
+
+      // Se le corta el envio para que no entre a media frase.
+      expect(pc._audioSender.pista).toBe(null);
+      expect(t.esperando.has('luis')).toBe(true);
+    });
+
+    it('entra en servicio en cuanto sueltas el boton', () => {
+      const { window, t } = crearApp();
+      const pc = peerFalso();
+      const pista = { kind: 'audio', id: 'mic' };
+
+      t.setStream({ getAudioTracks: () => [pista], getTracks: () => [pista] });
+      t.setRecording(true);
+      t.peers.set('luis', pc);
+      window.entrarEnServicio('luis', pc);
+      expect(pc._audioSender.pista).toBe(null);
+
+      // Al terminar de hablar se restablece su envio.
+      t.setRecording(false);
+      window.activarConexionesPendientes();
+
+      expect(pc._audioSender.pista).toBe(pista);
+      expect(t.esperando.has('luis')).toBe(false);
+    });
+
+    it('si no estas hablando, entra en servicio al instante', () => {
+      const { window, t } = crearApp();
+      const pc = peerFalso();
+      const pista = { kind: 'audio', id: 'mic' };
+
+      t.setStream({ getAudioTracks: () => [pista], getTracks: () => [pista] });
+      t.setRecording(false);
+      window.entrarEnServicio('luis', pc);
+
+      expect(pc._audioSender.pista).toBe(pista);
+      expect(t.esperando.has('luis')).toBe(false);
+    });
+
+    it('no toca nada si la conexion aun no esta establecida', () => {
+      const { window } = crearApp();
+      const pc = peerFalso('connecting');
+      window.entrarEnServicio('luis', pc);
+      expect(pc._audioSender.pista).toBe('inicial');
+    });
+
+    it('aplaza una conexion nueva mientras hablas', async () => {
+      const { window, t } = crearApp();
+      // connectWebRTC necesita un socket conectado para llegar a la logica.
+      t.setSocket({ connected: true, emit() {}, on() {} });
+      t.setRecording(true);
+      t.contacts.add('luis');
+
+      await window.connectWebRTC('luis');
+
+      // No se ha creado la conexion todavia; queda apuntada para despues.
+      expect(t.aplazadas.has('luis')).toBe(true);
+      expect(t.peers.has('luis')).toBe(false);
     });
   });
 

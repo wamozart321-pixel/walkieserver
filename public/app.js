@@ -316,6 +316,73 @@ function attachDataChannel(targetUserId, dc) {
     };
 }
 
+// ========== Entrada en servicio de una conexion ==========
+//
+// Una conexion P2P tarda entre uno y varios segundos en establecerse. Mientras
+// tanto el mensaje se envia igual: al soltar el boton viaja el clip completo por
+// el servidor (o por el canal de datos), asi que nadie se queda sin recibirlo.
+//
+// El problema esta en el momento exacto en que la conexion se completa: si eso
+// ocurre a mitad de una transmision, el otro extremo empezaria a oir la frase
+// por la mitad y ademas recibiria el clip entero al soltar. Por eso una
+// conexion que termina de negociarse mientras estas hablando NO entra en
+// servicio hasta que sueltas el boton.
+
+/// Peers que han conectado durante una transmision y esperan a que termine.
+const peersEsperandoFinTx = new Set();
+/// Contactos cuya conexion se ha aplazado por estar transmitiendo.
+const conexionesAplazadas = new Set();
+
+function entrarEnServicio(targetUserId, pc) {
+    if (!pc || pc.connectionState !== 'connected') return;
+
+    if (isRecording) {
+        // Conecto a media frase: se corta su envio hasta que termine.
+        silenciarPeer(pc, true);
+        peersEsperandoFinTx.add(targetUserId);
+        console.log(`[WebRTC] ${targetUserId} conectado durante una transmision: entra en servicio al soltar.`);
+        return;
+    }
+
+    silenciarPeer(pc, false);
+    peersEsperandoFinTx.delete(targetUserId);
+}
+
+/// Corta o restablece el envio a un peer concreto sin renegociar la sesion.
+/// (setMicEnabled afecta al track, que es comun a todas las conexiones.)
+function silenciarPeer(pc, silenciar) {
+    const sender = pc?._audioSender;
+    if (!sender || typeof sender.replaceTrack !== 'function') return;
+
+    try {
+        const pista = silenciar ? null : (currentStream?.getAudioTracks()[0] || null);
+        sender.replaceTrack(pista);
+    } catch (err) {
+        console.warn('[WebRTC] No se pudo cambiar la pista del peer:', err);
+    }
+}
+
+/// Al terminar de hablar: las conexiones que se completaron mientras tanto
+/// entran en servicio, y se lanzan las que se habian aplazado.
+function activarConexionesPendientes() {
+    for (const userId of Array.from(peersEsperandoFinTx)) {
+        const pc = rtcPeers.get(userId);
+        peersEsperandoFinTx.delete(userId);
+        if (!pc) continue;
+        silenciarPeer(pc, false);
+        console.log(`[WebRTC] ${userId} entra en servicio (transmision terminada).`);
+    }
+
+    for (const userId of Array.from(conexionesAplazadas)) {
+        conexionesAplazadas.delete(userId);
+        if (!selectedContacts.has(userId)) continue;
+        connectWebRTC(userId).catch((e) => console.warn('[WebRTC] Conexion aplazada fallida:', e));
+    }
+
+    refreshConnLabels();
+    updateAudioStats();
+}
+
 function createPeerConnection(targetUserId, isInitiator = false) {
     if (rtcPeers.has(targetUserId)) {
         closePeerConnection(targetUserId);
@@ -353,6 +420,9 @@ function createPeerConnection(targetUserId, isInitiator = false) {
     pc.onconnectionstatechange = () => {
         const state = pc.connectionState || pc.iceConnectionState;
         console.log(`[WebRTC] ${targetUserId}: ${state}`);
+
+        if (state === 'connected') entrarEnServicio(targetUserId, pc);
+
         updateAudioStats();
         refreshConnLabels();
         if (state === 'failed' || state === 'closed') {
@@ -423,6 +493,8 @@ function closePeerConnection(userId) {
     e2eKeyExchangeSent.delete(userId);
     e2ePendingClips.delete(userId);
     rtcPendingIce.delete(userId);
+    peersEsperandoFinTx.delete(userId);
+    conexionesAplazadas.delete(userId);
 }
 
 function closeAllPeerConnections() {
@@ -561,11 +633,20 @@ async function connectWebRTC(targetUserId) {
     // Disparamos el intercambio E2E en paralelo (no bloquea el media path).
     sendPublicKeyTo(targetUserId).catch((e) => console.warn('[E2E] Error enviando clave:', e));
 
+    // Si estamos hablando, la conexion se aplaza: negociar en mitad de una
+    // transmision hace que el otro extremo entre a media frase.
+    if (isRecording) {
+        conexionesAplazadas.add(targetUserId);
+        console.log(`[WebRTC] Conexion con ${targetUserId} aplazada hasta terminar de hablar.`);
+        return;
+    }
+
     const stream = await ensureMicStream();
     const pc = createPeerConnection(targetUserId, true);
 
     stream.getAudioTracks().forEach(track => {
-        pc.addTrack(track, stream);
+        // Se guarda el sender para poder cortar el envio a este peer concreto.
+        pc._audioSender = pc.addTrack(track, stream);
     });
 
     try {
@@ -594,8 +675,15 @@ async function handleIncomingOffer(fromUserId, offer) {
         pc = createPeerConnection(fromUserId, false);
         const stream = await ensureMicStream();
         stream.getAudioTracks().forEach(track => {
-            pc.addTrack(track, stream);
+            pc._audioSender = pc.addTrack(track, stream);
         });
+
+        // Nos llaman mientras hablamos: se acepta la conexion (para no perder la
+        // negociacion) pero no se envia nada por ella hasta soltar el boton.
+        if (isRecording) {
+            silenciarPeer(pc, true);
+            peersEsperandoFinTx.add(fromUserId);
+        }
     }
 
     // Perfect negotiation: si llega offer cuando ya estamos negociando,
@@ -1091,7 +1179,11 @@ function applyConnLabelToItem(userItem, user) {
         userItem.appendChild(label);
     }
     const state = getPeerReadiness(user);
-    if (state === 'ready') {
+    if (state === 'ready' && peersEsperandoFinTx.has(user)) {
+        // Conectó mientras hablabas: entra en servicio al soltar el botón.
+        userItem.classList.add('conn-connecting');
+        label.textContent = 'LISTO AL SOLTAR';
+    } else if (state === 'ready') {
         userItem.classList.add('conn-ready');
         label.textContent = 'LISTO';
     } else if (state === 'failed') {
@@ -1476,6 +1568,10 @@ function stopRecording() {
 
     // Mutear el track: corta el audio en WebRTC al instante.
     setMicEnabled(false);
+
+    // Las conexiones que se completaron mientras hablabas entran en servicio
+    // ahora, y las que se aplazaron se lanzan.
+    activarConexionesPendientes();
 
     // Parar MediaRecorder para generar el clip del historial.
     if (mediaRecorder && mediaRecorder.state !== 'inactive') {

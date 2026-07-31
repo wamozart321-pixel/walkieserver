@@ -3,3 +3,11 @@ node_modules/
 certs/
 npm-debug.log*
 data/app-users.json
+
+# Salida de los instaladores (se regeneran; el .exe pesa ~92 MB)
+dist-desktop/
+installer/dist/
+android/local.properties
+android/build/
+android/app/build/
+android/.gradle/

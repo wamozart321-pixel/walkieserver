@@ -3,7 +3,11 @@
   "appName": "WeasyTalkie",
   "webDir": "public",
   "server": {
+    "url": "https://weasytalkie.onrender.com",
     "androidScheme": "https",
     "cleartext": true
+  },
+  "android": {
+    "allowMixedContent": true
   }
 }
