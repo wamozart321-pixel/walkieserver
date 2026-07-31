@@ -788,3 +788,68 @@ input[type="password"]:focus {
 .invite-group {
     margin-top: 10px;
 }
+
+/* ========== Diálogo de texto (sustituye a prompt(), que Electron no tiene) ========== */
+
+.modal-fondo {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.66);
+    backdrop-filter: blur(3px);
+    display: grid;
+    place-items: center;
+    z-index: 10000;
+    animation: toast-in 0.15s ease-out;
+    padding: 20px;
+}
+
+.modal-caja {
+    width: min(94vw, 420px);
+    padding: 22px;
+    border-radius: 18px;
+    background: linear-gradient(165deg, rgba(26, 19, 10, 0.98), rgba(13, 9, 5, 0.98));
+    border: 1px solid var(--border-soft);
+    box-shadow: var(--shadow-deep);
+}
+
+.modal-caja h3 {
+    font-family: 'Orbitron', sans-serif;
+    color: var(--amber-300);
+    font-size: 1.1rem;
+    margin-bottom: 6px;
+}
+
+.modal-descripcion {
+    color: var(--text-soft);
+    font-size: 0.92rem;
+    margin-bottom: 14px;
+}
+
+.modal-caja input[type="text"] {
+    width: 100%;
+    border: 1px solid rgba(255, 185, 78, 0.36);
+    border-radius: 12px;
+    padding: 12px 14px;
+    color: var(--text-main);
+    background: rgba(28, 19, 9, 0.78);
+    font-family: 'Rajdhani', sans-serif;
+    font-size: 1.02rem;
+}
+
+.modal-caja input[type="text"]:focus {
+    outline: none;
+    border-color: var(--amber-400);
+    box-shadow: 0 0 0 3px rgba(255, 186, 82, 0.2);
+}
+
+.modal-botones {
+    display: flex;
+    gap: 10px;
+    justify-content: flex-end;
+    margin-top: 18px;
+}
+
+.modal-botones button {
+    padding: 10px 20px;
+    border-radius: 12px;
+}

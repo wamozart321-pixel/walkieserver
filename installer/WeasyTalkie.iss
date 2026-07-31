@@ -6,7 +6,7 @@
 ; WebRTC igual que en el navegador.
 
 #define AppName        "WeasyTalkie"
-#define AppVersion     "1.1.0"
+#define AppVersion     "1.2.0"
 #define AppPublisher   "WeasyTalkie"
 #define AppExe         "WeasyTalkie.exe"
 #define SourceDir      "..\dist-desktop\WeasyTalkie-win"
@@ -68,3 +68,5 @@ Filename: "{app}\{#AppExe}"; Description: "Abrir {#AppName} ahora"; Flags: nowai
 [UninstallDelete]
 ; Datos del navegador integrado (caché, sesión).
 Type: filesandordirs; Name: "{userappdata}\WeasyTalkie"
+
+

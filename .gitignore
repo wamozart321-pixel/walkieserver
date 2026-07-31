@@ -11,3 +11,7 @@ android/local.properties
 android/build/
 android/app/build/
 android/.gradle/
+
+# Claves de firma de Android: NUNCA deben subirse al repositorio
+android/keystore/
+android/keystore.properties

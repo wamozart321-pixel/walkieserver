@@ -1,14 +1,43 @@
 # WeasyTalkie — notas de la revisión
 
-## Instaladores (1.1)
+## Correcciones de la 1.2
+
+**No se podían crear canales en la aplicación de escritorio.** El nombre se pedía
+con `prompt()`, que **Electron no implementa** (Chromium lo eliminó): el botón no
+hacía absolutamente nada en el `.exe`, aunque en el navegador funcionara. Ahora
+se usa un diálogo propio, que además se ve bien en el móvil.
+
+**Los canales que creabas solo existían en tu navegador.** Nadie más los veía en
+la lista. Ahora el servidor mantiene la lista y la reparte a todo el mundo
+(`channel-list`).
+
+**No había voz en tiempo real, solo el mensaje en el historial.** Con únicamente
+servidores STUN, dos equipos en redes distintas (datos móviles, oficinas con
+firewall, NAT simétrico) **no llegan a establecer la conexión directa**, así que
+el audio en vivo nunca empezaba y solo quedaba el clip que se envía al soltar.
+Se ha añadido un **servidor TURN de reserva** que cubre esos casos:
+
+- Si defines `TURN_URL` en el servidor, se usa el tuyo.
+- Si no, se usa uno público y gratuito (`openrelay.metered.ca`).
+- Se puede desactivar con `TURN_PUBLICO=false`.
+
+El audio sigue cifrado de extremo a extremo (SRTP y AES-GCM); el TURN solo
+reenvía paquetes que no puede leer.
+
+Además, ahora la barra de estado **dice si hay voz en directo o no**
+("VOZ EN DIRECTO", "directo con 1 de 2", "conectando (el mensaje llega al
+soltar)") y desde la consola del navegador `diagnostico()` muestra por qué vía
+va cada conexión: directa o por TURN.
+
+## Instaladores
 
 Los dos apuntan a **https://weasytalkie.onrender.com**, que es donde está
 publicada la web.
 
 | Archivo | Qué es |
 |---|---|
-| `installer/dist/WeasyTalkie_1.1.0_Setup.exe` (92 MB) | Aplicación de escritorio para Windows |
-| `installer/dist/WeasyTalkie_1.1.0.apk` (5 MB) | Aplicación para Android |
+| `installer/dist/WeasyTalkie_1.2.0_Setup.exe` (92 MB) | Aplicación de escritorio para Windows |
+| `installer/dist/WeasyTalkie_1.2.0.apk` (4 MB) | Aplicación para Android, **firmada para publicación** |
 
 **Escritorio (Windows).** Una ventana de Electron que abre la web; el audio va
 por WebRTC igual que en el navegador. Concede el permiso de micrófono sin
@@ -28,24 +57,29 @@ npx electron-builder --win --dir            (o el montaje manual, ver abajo)
 > impide sin permisos de administrador. Por eso el `.exe` final se arma con Inno
 > Setup, que ya se usaba para la otra aplicación.
 
-**Android.** APK de depuración (firmado con la clave de depuración, se instala
-activando "orígenes desconocidos"). Se le añadieron los permisos que faltaban:
-`RECORD_AUDIO` y `MODIFY_AUDIO_SETTINGS` — **sin ellos la aplicación no podía
-usar el micrófono**, que es justo lo que hace un walkie-talkie.
+**Android.** APK **de publicación, firmado** con una clave propia (no la de
+depuración). Se le añadieron los permisos que faltaban: `RECORD_AUDIO` y
+`MODIFY_AUDIO_SETTINGS` — **sin ellos la aplicación no podía usar el micrófono**,
+que es justo lo que hace un walkie-talkie.
 
 Se genera con:
 
 ```
 npx cap sync android
-cd android && gradlew assembleDebug
+cd android && gradlew assembleRelease
 ```
+
+> **La clave de firma está en `android/keystore/`, fuera del repositorio.**
+> Guárdala en sitio seguro junto con su contraseña (`android/keystore/clave.txt`):
+> si se pierde, Google Play no deja publicar actualizaciones de la aplicación y
+> hay que subirla como una app nueva.
 
 > Requiere `JAVA_HOME` apuntando al JDK de Android Studio y `ANDROID_HOME` al SDK.
 > Como la carpeta del usuario lleva una "Ñ", hizo falta `android.overridePathCheck=true`
 > en `android/gradle.properties`: Gradle se niega a compilar en rutas no ASCII.
 >
-> Para publicarlo en Google Play haría falta un APK/AAB **firmado con tu propia
-> clave**; el de depuración sirve para instalarlo a mano en los móviles.
+> Para publicarlo en Google Play conviene generar un AAB (`gradlew bundleRelease`)
+> con esa misma clave.
 
 ## Entrada en servicio de las conexiones (1.1)
 

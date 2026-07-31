@@ -287,8 +287,21 @@ function updateAudioStats() {
     const dcOpen = Array.from(rtcDataChannels.values()).filter(dc => dc.readyState === 'open').length;
     const e2e = e2eSharedKeys.size;
     const kbps = Math.round(getAudioProfile().bitrate / 1000);
+
+    // Deja claro si la voz va en directo o si el mensaje solo llega al soltar.
+    let modo;
+    if (peers === 0) {
+        modo = 'sin conexiones';
+    } else if (connected === peers) {
+        modo = 'VOZ EN DIRECTO';
+    } else if (connected > 0) {
+        modo = `directo con ${connected} de ${peers}`;
+    } else {
+        modo = 'conectando (el mensaje llega al soltar)';
+    }
+
     audioStats.textContent =
-        `WebRTC ${kbps}kbps | RTT: ${rtt} | Directo: ${connected}/${peers} | Datos: ${dcOpen} | Cifrado: ${e2e}`;
+        `${modo} | ${kbps}kbps | RTT: ${rtt} | Datos: ${dcOpen} | Cifrado: ${e2e}`;
 }
 
 // ========== WEBRTC (AUDIO EN TIEMPO REAL) ==========
@@ -355,12 +368,75 @@ function silenciarPeer(pc, silenciar) {
     if (!sender || typeof sender.replaceTrack !== 'function') return;
 
     try {
-        const pista = silenciar ? null : (currentStream?.getAudioTracks()[0] || null);
-        sender.replaceTrack(pista);
+        if (silenciar) {
+            sender.replaceTrack(null);
+            return;
+        }
+
+        // Al restablecer, si no hay microfono disponible no se toca el sender:
+        // ponerle null aqui lo dejaria mudo para siempre.
+        const pista = currentStream?.getAudioTracks()[0];
+        if (pista) sender.replaceTrack(pista);
     } catch (err) {
         console.warn('[WebRTC] No se pudo cambiar la pista del peer:', err);
     }
 }
+
+/**
+ * Averigua por que via esta yendo el audio: directa entre los dos equipos o a
+ * traves de un servidor TURN. Sirve para saber si el tiempo real funciona y,
+ * cuando no, por que.
+ */
+async function describirConexion(userId) {
+    const pc = rtcPeers.get(userId);
+    if (!pc || typeof pc.getStats !== 'function') return null;
+
+    try {
+        const stats = await pc.getStats();
+        let pareja = null;
+        const candidatos = new Map();
+
+        stats.forEach((r) => {
+            if (r.type === 'local-candidate' || r.type === 'remote-candidate') candidatos.set(r.id, r);
+            if (r.type === 'candidate-pair' && r.state === 'succeeded' && r.nominated) pareja = r;
+        });
+
+        if (!pareja) return { estado: pc.connectionState, via: 'sin ruta' };
+
+        const local = candidatos.get(pareja.localCandidateId);
+        const remoto = candidatos.get(pareja.remoteCandidateId);
+        const usaRelay = local?.candidateType === 'relay' || remoto?.candidateType === 'relay';
+
+        return {
+            estado: pc.connectionState,
+            via: usaRelay ? 'TURN (retransmitido)' : 'directa',
+            tipoLocal: local?.candidateType,
+            tipoRemoto: remoto?.candidateType,
+            rtt: pareja.currentRoundTripTime
+        };
+    } catch (err) {
+        return { estado: pc.connectionState, via: 'desconocida', error: err.message };
+    }
+}
+
+/** Diagnóstico completo, accesible desde la consola del navegador. */
+window.diagnostico = async function () {
+    const filas = [];
+    for (const userId of selectedContacts) {
+        const info = await describirConexion(userId);
+        filas.push({
+            contacto: userId,
+            estado: info?.estado ?? 'sin conexión',
+            via: info?.via ?? '-',
+            'RTT(ms)': info?.rtt ? Math.round(info.rtt * 1000) : '-',
+            'canal datos': isPeerDataChannelOpen(userId) ? 'abierto' : 'cerrado',
+            cifrado: e2eSharedKeys.has(userId) ? 'sí' : 'no'
+        });
+    }
+    console.table(filas);
+    console.log('Servidores ICE en uso:', RTC_CONFIG.iceServers);
+    return filas;
+};
 
 /// Al terminar de hablar: las conexiones que se completaron mientras tanto
 /// entran en servicio, y se lanzan las que se habian aplazado.
@@ -972,6 +1048,14 @@ function connectToServer() {
         socket.on('channel-users', (users) => {
             usersInChannel = users;
             updateUsersList();
+        });
+
+        // Lista de canales compartida por el servidor.
+        socket.on('channel-list', (canales) => {
+            if (!Array.isArray(canales)) return;
+            const actual = channelSelect.value;
+            canales.forEach(anadirCanalALaLista);
+            if (actual) channelSelect.value = actual;
         });
 
         socket.on('user-joined', (data) => {
@@ -1773,26 +1857,113 @@ channelSelect.addEventListener('change', () => {
 });
 
 // Crear nuevo canal
-createChannelBtn.addEventListener('click', () => {
-    const newChannel = prompt('Nombre del nuevo canal:');
-    if (newChannel && newChannel.trim()) {
-        const option = document.createElement('option');
-        option.value = newChannel.trim();
-        option.textContent = `📢 ${newChannel.trim()}`;
-        channelSelect.appendChild(option);
-        channelSelect.value = newChannel.trim();
-        
-        // Cambiar al nuevo canal
-        if (socket && socket.connected) {
-            socket.emit('join-channel', {
-                userId: currentUser,
-                password: currentPassword,
-                channelName: newChannel.trim()
-            });
-            currentChannel = newChannel.trim();
-        }
+//
+// Antes se pedia el nombre con prompt(). Electron no lo implementa (Chromium lo
+// quito), asi que en la aplicacion de escritorio el boton no hacia absolutamente
+// nada. Ahora se usa un dialogo propio, que ademas funciona igual en movil.
+createChannelBtn.addEventListener('click', async () => {
+    const nombre = await pedirTexto({
+        titulo: 'Nuevo canal',
+        descripcion: 'Todos los que entren a este canal podrán hablar entre sí.',
+        marcador: 'ventas, almacén, soporte...',
+        aceptar: 'Crear canal'
+    });
+
+    if (!nombre) return;
+
+    const limpio = nombre.trim().toLowerCase().replace(/\s+/g, '-');
+    if (!/^[a-z0-9._-]{1,30}$/.test(limpio)) {
+        showToast('Nombre no válido. Usa letras, números, punto, guion o guion bajo.', 'warn', 5000);
+        return;
     }
+
+    if (!socket || !socket.connected) {
+        showToast('No estás conectado al servidor.', 'error');
+        return;
+    }
+
+    anadirCanalALaLista(limpio);
+    channelSelect.value = limpio;
+    currentChannel = limpio;
+
+    socket.emit('join-channel', {
+        userId: currentUser,
+        password: currentPassword,
+        channelName: limpio
+    });
 });
+
+/** Añade un canal al desplegable si no estaba ya. */
+function anadirCanalALaLista(nombre) {
+    const existe = Array.from(channelSelect.options).some((o) => o.value === nombre);
+    if (existe) return;
+
+    const option = document.createElement('option');
+    option.value = nombre;
+    option.textContent = nombre;
+    channelSelect.appendChild(option);
+}
+
+/**
+ * Diálogo de texto propio. Sustituye a prompt(), que no existe en Electron y
+ * queda feo en el móvil.
+ */
+function pedirTexto({ titulo, descripcion = '', marcador = '', aceptar = 'Aceptar', valor = '' }) {
+    return new Promise((resolve) => {
+        const fondo = document.createElement('div');
+        fondo.className = 'modal-fondo';
+
+        const caja = document.createElement('div');
+        caja.className = 'modal-caja';
+
+        const h = document.createElement('h3');
+        h.textContent = titulo;
+
+        const p = document.createElement('p');
+        p.className = 'modal-descripcion';
+        p.textContent = descripcion;
+
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.placeholder = marcador;
+        input.value = valor;
+        input.maxLength = 30;
+
+        const botones = document.createElement('div');
+        botones.className = 'modal-botones';
+
+        const btnCancelar = document.createElement('button');
+        btnCancelar.className = 'btn-secondary';
+        btnCancelar.textContent = 'Cancelar';
+
+        const btnAceptar = document.createElement('button');
+        btnAceptar.className = 'btn-primary';
+        btnAceptar.textContent = aceptar;
+
+        const cerrar = (resultado) => {
+            document.removeEventListener('keydown', alPulsarTecla);
+            fondo.remove();
+            resolve(resultado);
+        };
+
+        const alPulsarTecla = (e) => {
+            if (e.key === 'Escape') cerrar(null);
+            if (e.key === 'Enter' && document.activeElement === input) cerrar(input.value);
+        };
+
+        btnCancelar.addEventListener('click', () => cerrar(null));
+        btnAceptar.addEventListener('click', () => cerrar(input.value));
+        fondo.addEventListener('click', (e) => { if (e.target === fondo) cerrar(null); });
+        document.addEventListener('keydown', alPulsarTecla);
+
+        botones.append(btnCancelar, btnAceptar);
+        caja.append(h, p, input, botones);
+        fondo.appendChild(caja);
+        document.body.appendChild(fondo);
+
+        input.focus();
+    });
+}
 
 // Prevenir que el botón PTT pierda el foco
 pttButton.addEventListener('contextmenu', (e) => e.preventDefault());

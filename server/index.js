@@ -96,6 +96,10 @@ const ALLOW_REGISTRATION = String(process.env.ALLOW_REGISTRATION ?? 'true').toLo
 // Si se define, hace falta escribirla para poder registrarse.
 const REGISTRATION_CODE = process.env.REGISTRATION_CODE || '';
 
+// TURN publico de reserva cuando no hay uno propio configurado. Se puede
+// desactivar con TURN_PUBLICO=false si se prefiere no depender de terceros.
+const USE_PUBLIC_TURN = String(process.env.TURN_PUBLICO ?? 'true').toLowerCase() === 'true';
+
 // Capa 2: usuarios de la app (usuario:clave separados por coma)
 // Ejemplo: APP_USERS=ana:1234,luis:abcd,maria:clave
 const APP_USERS_RAW = process.env.APP_USERS || '';
@@ -193,10 +197,26 @@ app.get('/ice-config', (req, res) => {
   ];
 
   if (process.env.TURN_URL) {
+    // TURN propio: es la opcion recomendada en produccion.
     const turn = { urls: process.env.TURN_URL.split(',').map((u) => u.trim()).filter(Boolean) };
     if (process.env.TURN_USER) turn.username = process.env.TURN_USER;
     if (process.env.TURN_PASS) turn.credential = process.env.TURN_PASS;
     iceServers.push(turn);
+  } else if (USE_PUBLIC_TURN) {
+    // Sin TURN, dos usuarios en redes distintas (datos moviles, oficinas con
+    // firewall, NAT simetrico) no llegan a establecer la conexion directa y se
+    // quedan sin voz en tiempo real: solo les llega el mensaje al soltar.
+    // Este TURN publico y gratuito cubre esos casos. El audio sigue cifrado
+    // extremo a extremo (SRTP + AES-GCM); el relay solo reenvia paquetes.
+    iceServers.push({
+      urls: [
+        'turn:openrelay.metered.ca:80',
+        'turn:openrelay.metered.ca:443',
+        'turn:openrelay.metered.ca:443?transport=tcp'
+      ],
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    });
   }
 
   res.json({ iceServers });
@@ -213,6 +233,22 @@ app.get('/app-config', (req, res) => {
 // Memoria en proceso (futuro: Redis)
 const users = new Map(); // socketId -> { userId, channel }
 const channels = new Map(); // channelName -> Set<socketId>
+
+// Canales conocidos, incluidos los que se quedan vacios. Asi la lista que ve
+// cada usuario es la misma para todos.
+const CANALES_FIJOS = ['general', 'random', 'soporte'];
+const canalesConocidos = new Set(CANALES_FIJOS);
+
+function recordarCanal(nombre) {
+  if (typeof nombre !== 'string') return;
+  const limpio = nombre.trim().toLowerCase();
+  if (!/^[a-z0-9._-]{1,30}$/.test(limpio)) return;
+  canalesConocidos.add(limpio);
+}
+
+function listaDeCanales() {
+  return Array.from(canalesConocidos).sort();
+}
 const authenticatedSockets = new Map(); // socketId -> userId autenticado en la app
 
 app.get('/health', (req, res) => {
@@ -377,6 +413,11 @@ io.on('connection', (socket) => {
 
     io.to(requestedChannel).emit('channel-users', usersInChannel);
     socket.emit('join-success', { userId: authUserId, channel: requestedChannel });
+
+    // Los canales que alguien creaba solo existian en su navegador: nadie mas
+    // los veia en la lista. Ahora se reparten a todo el mundo.
+    recordarCanal(requestedChannel);
+    io.emit('channel-list', listaDeCanales());
   });
 
   // Solo se permite si el socket esta autenticado y el destinatario esta en el mismo canal.
