@@ -329,6 +329,306 @@ function attachDataChannel(targetUserId, dc) {
     };
 }
 
+// ========== Seguir activo en segundo plano ==========
+//
+// Con la pestana en segundo plano (o el movil con la pantalla apagada), el
+// navegador ralentiza los temporizadores y el sistema puede suspender la
+// aplicacion, con lo que dejarian de llegar mensajes. Dos medidas:
+//
+//  1. Wake Lock: pide al sistema que no apague la pantalla mientras se esta
+//     conectado. Es lo unico que Android respeta sin codigo nativo.
+//  2. Una pista de audio en silencio siempre sonando: mientras hay audio
+//     activo, ni el navegador ni Android suspenden el proceso.
+
+let wakeLock = null;
+let silencioContext = null;
+
+async function mantenerActivo() {
+    // 1. Evitar que la pantalla se apague.
+    try {
+        if ('wakeLock' in navigator && !wakeLock) {
+            wakeLock = await navigator.wakeLock.request('screen');
+            wakeLock.addEventListener('release', () => { wakeLock = null; });
+            console.log('[Segundo plano] Pantalla mantenida activa.');
+        }
+    } catch (err) {
+        // Si el navegador lo deniega (o la pestana no esta visible) no pasa nada.
+        console.warn('[Segundo plano] Wake Lock no disponible:', err.message);
+    }
+
+    // 2. Mantener viva la sesion de audio.
+    try {
+        if (!silencioContext && AudioContextClass) {
+            silencioContext = new AudioContextClass();
+            const fuente = silencioContext.createBufferSource();
+            // Un buffer de silencio en bucle: consumo despreciable.
+            fuente.buffer = silencioContext.createBuffer(1, silencioContext.sampleRate, silencioContext.sampleRate);
+            fuente.loop = true;
+            const volumen = silencioContext.createGain();
+            volumen.gain.value = 0.0001;
+            fuente.connect(volumen);
+            volumen.connect(silencioContext.destination);
+            fuente.start();
+        }
+        if (silencioContext?.state === 'suspended') await silencioContext.resume();
+    } catch (err) {
+        console.warn('[Segundo plano] No se pudo mantener la sesion de audio:', err.message);
+    }
+}
+
+function dejarDeMantenerActivo() {
+    try { wakeLock?.release(); } catch (_) {}
+    wakeLock = null;
+
+    try { silencioContext?.close(); } catch (_) {}
+    silencioContext = null;
+}
+
+// Al volver a primer plano hay que volver a pedir el Wake Lock: el sistema lo
+// libera solo cuando la pagina deja de ser visible.
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && socket?.connected) {
+        mantenerActivo();
+    }
+});
+
+// ========== Audio en directo a traves del servidor ==========
+//
+// La conexion directa (P2P) es la via preferida, pero no siempre se puede
+// establecer: entre dos redes con NAT estricto hace falta un servidor TURN y no
+// siempre hay uno disponible. Antes, en ese caso no habia voz en tiempo real: el
+// mensaje solo llegaba al soltar el boton.
+//
+// Aqui el audio se manda troceado por el mismo WebSocket que ya usa la
+// aplicacion, que funciona en cualquier red porque es el servidor al que ambos
+// extremos ya estan conectados. Solo se envia a los contactos que no tengan
+// conexion directa lista, para no duplicar el audio.
+
+const RELAY_RATE = 16000;        // suficiente para voz
+const RELAY_ENVIO_MS = 120;      // tamano de cada envio
+const RELAY_RETARDO_MS = 180;    // colchon inicial contra el jitter
+const RELAY_COLA_MAX_MS = 900;   // si se acumula mas, se recorta
+
+let relayContext = null;
+let relaySource = null;
+let relayProcessor = null;
+let relayMute = null;
+let relayBuffer = [];
+let relayMuestras = 0;
+let relayTransmisionId = null;
+
+/** Contactos seleccionados que NO tienen conexion directa lista. */
+function destinatariosSinDirecto() {
+    return Array.from(selectedContacts).filter((u) => {
+        const pc = rtcPeers.get(u);
+        const conectado = pc && pc.connectionState === 'connected';
+        // Si conecto a mitad de la frase, sigue sin estar en servicio: se le
+        // manda por el servidor hasta que se suelte el boton.
+        return !conectado || peersEsperandoFinTx.has(u);
+    });
+}
+
+function iniciarRelayEnDirecto(transmisionId) {
+    if (!AudioContextClass || !currentStream) return;
+    detenerRelayEnDirecto();
+
+    try {
+        relayContext = new AudioContextClass();
+        if (relayContext.state === 'suspended') relayContext.resume().catch(() => {});
+
+        relaySource = relayContext.createMediaStreamSource(currentStream);
+        relayProcessor = relayContext.createScriptProcessor(2048, 1, 1);
+
+        // Se conecta a un destino en silencio: sin esto, algunos navegadores no
+        // llaman al procesador de forma constante.
+        relayMute = relayContext.createGain();
+        relayMute.gain.value = 0;
+
+        relayBuffer = [];
+        relayMuestras = 0;
+        relayTransmisionId = transmisionId;
+
+        const muestrasPorEnvio = Math.round(RELAY_RATE * (RELAY_ENVIO_MS / 1000));
+
+        relayProcessor.onaudioprocess = (evento) => {
+            if (!isRecording || !socket || !socket.connected) return;
+
+            const destinos = destinatariosSinDirecto();
+            if (destinos.length === 0) return;   // todos escuchan ya en directo
+
+            const entrada = evento.inputBuffer.getChannelData(0);
+            const reducido = reducirFrecuencia(entrada, relayContext.sampleRate, RELAY_RATE);
+            if (!reducido.length) return;
+
+            relayBuffer.push(aInt16(reducido));
+            relayMuestras += reducido.length;
+            if (relayMuestras < muestrasPorEnvio) return;
+
+            const bloque = unirInt16(relayBuffer);
+            relayBuffer = [];
+            relayMuestras = 0;
+
+            socket.compress(false).emit('audio-stream', {
+                channel: currentChannel,
+                targetUsers: destinos,
+                audioData: bloque.buffer,
+                mode: 'pcm-live',
+                format: 'pcm16',
+                sampleRate: RELAY_RATE,
+                transmissionId: relayTransmisionId
+            });
+        };
+
+        relaySource.connect(relayProcessor);
+        relayProcessor.connect(relayMute);
+        relayMute.connect(relayContext.destination);
+    } catch (err) {
+        console.error('[Relay] No se pudo iniciar el audio por servidor:', err);
+        detenerRelayEnDirecto();
+    }
+}
+
+function detenerRelayEnDirecto() {
+    try {
+        if (relayProcessor) {
+            relayProcessor.onaudioprocess = null;
+            relayProcessor.disconnect();
+        }
+        relaySource?.disconnect();
+        relayMute?.disconnect();
+        if (relayContext && relayContext.state !== 'closed') relayContext.close().catch(() => {});
+    } catch (err) {
+        console.warn('[Relay] Error al cerrar:', err);
+    } finally {
+        relayProcessor = null;
+        relaySource = null;
+        relayMute = null;
+        relayContext = null;
+        relayBuffer = [];
+        relayMuestras = 0;
+        relayTransmisionId = null;
+    }
+}
+
+function reducirFrecuencia(datos, origen, destino) {
+    if (!datos || destino >= origen) return datos ? Float32Array.from(datos) : new Float32Array(0);
+
+    const proporcion = origen / destino;
+    const salida = new Float32Array(Math.round(datos.length / proporcion));
+    let iSalida = 0;
+    let iEntrada = 0;
+
+    while (iSalida < salida.length) {
+        const siguiente = Math.round((iSalida + 1) * proporcion);
+        let suma = 0;
+        let cuenta = 0;
+        for (let i = iEntrada; i < siguiente && i < datos.length; i++) {
+            suma += datos[i];
+            cuenta++;
+        }
+        salida[iSalida++] = cuenta ? suma / cuenta : 0;
+        iEntrada = siguiente;
+    }
+    return salida;
+}
+
+function aInt16(datos) {
+    const salida = new Int16Array(datos.length);
+    for (let i = 0; i < datos.length; i++) {
+        const v = Math.max(-1, Math.min(1, datos[i]));
+        salida[i] = v < 0 ? v * 0x8000 : v * 0x7fff;
+    }
+    return salida;
+}
+
+function unirInt16(trozos) {
+    const total = trozos.reduce((n, t) => n + t.length, 0);
+    const salida = new Int16Array(total);
+    let pos = 0;
+    for (const t of trozos) { salida.set(t, pos); pos += t.length; }
+    return salida;
+}
+
+// --- Reproducción de lo que llega por el servidor ---
+
+let repContext = null;
+let repSiguiente = 0;
+let repTransmision = null;
+
+// Para apagar el indicador de "hablando" cuando dejan de llegar trozos.
+const relayFinTimers = new Map();
+
+function aFloat32(int16) {
+    const salida = new Float32Array(int16.length);
+    for (let i = 0; i < int16.length; i++) salida[i] = int16[i] / 0x8000;
+    return salida;
+}
+
+function aInt16DesdeCarga(carga) {
+    if (!carga) return new Int16Array(0);
+    if (typeof carga === 'string') {
+        const binario = atob(carga);
+        const bytes = new Uint8Array(binario.length);
+        for (let i = 0; i < binario.length; i++) bytes[i] = binario.charCodeAt(i);
+        return new Int16Array(bytes.buffer);
+    }
+    if (carga instanceof ArrayBuffer) return new Int16Array(carga);
+    if (ArrayBuffer.isView(carga)) {
+        return new Int16Array(carga.buffer, carga.byteOffset, Math.floor(carga.byteLength / 2));
+    }
+    // Por si el servidor lo serializa como Buffer de Node.
+    if (carga.type === 'Buffer' && Array.isArray(carga.data)) {
+        return new Int16Array(new Uint8Array(carga.data).buffer);
+    }
+    return new Int16Array(0);
+}
+
+/**
+ * Encola un trozo recibido. La clave para que no suene entrecortado es
+ * programar cada trozo justo detrás del anterior en el reloj del AudioContext,
+ * en vez de reproducirlos según llegan.
+ */
+function reproducirTrozo(carga, frecuencia, transmisionId) {
+    if (!AudioContextClass) return;
+
+    try {
+        if (!repContext) repContext = new AudioContextClass();
+        if (repContext.state === 'suspended') repContext.resume().catch(() => {});
+
+        const pcm = aInt16DesdeCarga(carga);
+        if (!pcm.length) return;
+
+        // Transmisión nueva: se reinicia el colchón.
+        if (transmisionId && transmisionId !== repTransmision) {
+            repTransmision = transmisionId;
+            repSiguiente = 0;
+        }
+
+        const datos = aFloat32(pcm);
+        const buffer = repContext.createBuffer(1, datos.length, frecuencia || RELAY_RATE);
+        buffer.copyToChannel(datos, 0, 0);
+
+        const fuente = repContext.createBufferSource();
+        fuente.buffer = buffer;
+        fuente.connect(repContext.destination);
+
+        const ahora = repContext.currentTime;
+        const minimo = ahora + RELAY_RETARDO_MS / 1000;
+
+        if (repSiguiente < minimo) repSiguiente = minimo;
+
+        // Si se acumula demasiado retraso (red irregular), se recorta.
+        if (repSiguiente - ahora > RELAY_COLA_MAX_MS / 1000) {
+            repSiguiente = minimo;
+        }
+
+        fuente.start(repSiguiente);
+        repSiguiente += buffer.duration;
+    } catch (err) {
+        console.error('[Relay] Error reproduciendo:', err);
+    }
+}
+
 // ========== Entrada en servicio de una conexion ==========
 //
 // Una conexion P2P tarda entre uno y varios segundos en establecerse. Mientras
@@ -999,6 +1299,7 @@ function connectToServer() {
             isRecording = false;
             pttButton.classList.remove('recording');
             releaseMicStream();
+            dejarDeMantenerActivo();
             updateAudioStats();
         });
 
@@ -1026,6 +1327,10 @@ function connectToServer() {
             authPanel.style.display = 'none';
             mainPanel.style.display = 'grid';
             pttButton.disabled = false;
+
+            // A partir de aqui hay que seguir escuchando aunque la ventana
+            // pase a segundo plano.
+            mantenerActivo();
         });
 
         // El mismo usuario ha entrado desde otro dispositivo: el servidor cierra
@@ -1074,7 +1379,23 @@ function connectToServer() {
         // audio-broadcast solo se usa como fallback para clips de historial.
         // Si llega cifrado E2E (AES-GCM) lo desciframos con la clave compartida.
         socket.on('audio-broadcast', async (data) => {
-            if (!data || data.mode !== 'full') return;
+            if (!data) return;
+
+            // Voz en directo a través del servidor, para quien no tiene conexión
+            // directa. Antes estos paquetes se descartaban y no había tiempo real.
+            if (data.mode === 'pcm-live') {
+                reproducirTrozo(data.audioData, data.sampleRate, data.transmissionId);
+                updateUserTalking(data.userId, true);
+
+                clearTimeout(relayFinTimers.get(data.userId));
+                relayFinTimers.set(data.userId, setTimeout(() => {
+                    updateUserTalking(data.userId, false);
+                    relayFinTimers.delete(data.userId);
+                }, 700));
+                return;
+            }
+
+            if (data.mode !== 'full') return;
             try {
                 if (data.encryption && data.encryption.algorithm === 'AES-GCM') {
                     const plain = await decryptFromPeer(data.userId, data.encryption.iv, data.audioData);
@@ -1553,6 +1874,10 @@ async function startRecording() {
         // Desmutear el track de audio: el audio empieza a fluir por WebRTC al instante.
         setMicEnabled(true);
 
+        // A quien no tenga conexion directa lista se le manda la voz por el
+        // servidor, para que tambien la oiga en tiempo real.
+        iniciarRelayEnDirecto(`tx-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`);
+
         // Iniciar MediaRecorder en paralelo solo para guardar historial al soltar.
         mediaRecorderChunks = [];
         const preferredTypes = [
@@ -1652,6 +1977,7 @@ function stopRecording() {
 
     // Mutear el track: corta el audio en WebRTC al instante.
     setMicEnabled(false);
+    detenerRelayEnDirecto();
 
     // Las conexiones que se completaron mientras hablabas entran en servicio
     // ahora, y las que se aplazaron se lanzan.
@@ -1787,6 +2113,7 @@ if (passwordInput) {
 disconnectBtn.addEventListener('click', () => {
     closeAllPeerConnections();
     releaseMicStream();
+    dejarDeMantenerActivo();
     if (socket) {
         socket.disconnect();
         authPanel.style.display = 'block';

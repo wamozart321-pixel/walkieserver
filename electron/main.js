@@ -1,6 +1,6 @@
 // Aplicación de escritorio: una ventana que abre la web del servidor.
 // El audio va por WebRTC igual que en el navegador.
-const { app, BrowserWindow, session, shell, Menu } = require('electron');
+const { app, BrowserWindow, session, shell, Menu, Tray, nativeImage, powerSaveBlocker } = require('electron');
 const path = require('path');
 const fs = require('fs');
 
@@ -25,6 +25,63 @@ function leerServidor() {
 }
 
 let ventana = null;
+let bandeja = null;
+let salirDeVerdad = false;
+let bloqueoSuspension = null;
+
+/**
+ * Impide que Windows suspenda el equipo mientras la aplicación está abierta:
+ * un walkie-talkie que se duerme deja de recibir avisos.
+ */
+function evitarSuspension() {
+    try {
+        if (bloqueoSuspension === null || !powerSaveBlocker.isStarted(bloqueoSuspension)) {
+            bloqueoSuspension = powerSaveBlocker.start('prevent-app-suspension');
+        }
+    } catch (err) {
+        console.warn('No se pudo evitar la suspensión:', err.message);
+    }
+}
+
+/**
+ * Icono en la bandeja del sistema. Al cerrar la ventana la aplicación sigue
+ * funcionando ahí: se siguen recibiendo mensajes con la ventana cerrada.
+ */
+function crearBandeja() {
+    if (bandeja) return;
+
+    let icono = nativeImage.createFromPath(path.join(__dirname, '..', 'public', 'icon-512.png'));
+    if (!icono.isEmpty()) icono = icono.resize({ width: 16, height: 16 });
+
+    bandeja = new Tray(icono);
+    bandeja.setToolTip('WeasyTalkie');
+
+    const menu = Menu.buildFromTemplate([
+        {
+            label: 'Abrir WeasyTalkie',
+            click: () => {
+                if (!ventana) crearVentana();
+                ventana.show();
+                ventana.focus();
+            }
+        },
+        { type: 'separator' },
+        {
+            label: 'Salir',
+            click: () => {
+                salirDeVerdad = true;
+                app.quit();
+            }
+        }
+    ]);
+
+    bandeja.setContextMenu(menu);
+    bandeja.on('double-click', () => {
+        if (!ventana) crearVentana();
+        ventana.show();
+        ventana.focus();
+    });
+}
 
 function crearVentana() {
   const url = leerServidor();
@@ -85,6 +142,22 @@ function crearVentana() {
     );
   });
 
+  // Cerrar la ventana no cierra la aplicación: se queda en la bandeja
+  // escuchando, que es lo propio de un walkie-talkie.
+  ventana.on('close', (e) => {
+    if (salirDeVerdad) return;
+    e.preventDefault();
+    ventana.hide();
+
+    if (bandeja && !ventana._avisoBandeja) {
+      ventana._avisoBandeja = true;
+      bandeja.displayBalloon({
+        title: 'WeasyTalkie sigue activo',
+        content: 'Seguirás recibiendo mensajes. Usa Salir en este icono para cerrarlo del todo.'
+      });
+    }
+  });
+
   ventana.on('closed', () => { ventana = null; });
 }
 
@@ -102,6 +175,8 @@ if (!bloqueo) {
 
   app.whenReady().then(() => {
     Menu.setApplicationMenu(null);
+    crearBandeja();
+    evitarSuspension();
     crearVentana();
 
     app.on('activate', () => {
@@ -109,7 +184,10 @@ if (!bloqueo) {
     });
   });
 
+  // No se cierra al ocultar la ventana: sigue en la bandeja.
   app.on('window-all-closed', () => {
-    if (process.platform !== 'darwin') app.quit();
+    if (salirDeVerdad && process.platform !== 'darwin') app.quit();
   });
+
+  app.on('before-quit', () => { salirDeVerdad = true; });
 }

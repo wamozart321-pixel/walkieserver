@@ -1,5 +1,38 @@
 # WeasyTalkie — notas de la revisión
 
+## Voz en tiempo real siempre (1.3)
+
+La conexión directa entre navegadores es la vía preferida, pero **no siempre se
+puede establecer**: entre dos redes con NAT estricto hace falta un servidor TURN,
+y los públicos gratuitos no son fiables. Cuando eso pasaba, no había voz en
+directo: el mensaje solo llegaba al soltar el botón.
+
+Ahora, **a quien no tenga conexión directa lista se le manda la voz por tu propio
+servidor**, troceada por el mismo WebSocket que ya usa la aplicación. Funciona en
+cualquier red, porque es el servidor al que ambos extremos ya están conectados.
+
+- Se envía **solo** a los contactos sin conexión directa, para no duplicar audio.
+- En cuanto la conexión directa entra en servicio, se deja de usar el servidor.
+- Si la conexión se completa a media frase, se sigue por el servidor hasta que
+  sueltas: así no se corta la frase por la mitad.
+
+Probado: hablando **antes** de que la conexión directa estuviera lista, llegaron
+10 trozos de voz en directo por el servidor, el relevo se cerró al soltar y la
+conexión quedó establecida para el mensaje siguiente.
+
+## Seguir activo en segundo plano (1.3)
+
+| Dónde | Qué hace |
+|---|---|
+| **Escritorio (.exe)** | Icono en la bandeja del sistema. Cerrar la ventana **no** cierra la aplicación: sigue recibiendo. Se sale con *Salir* en el icono. Además impide que Windows suspenda el equipo. |
+| **Web y Android** | Se pide *Wake Lock* (que la pantalla no se apague) y se mantiene una pista de audio en silencio: mientras hay audio activo, ni el navegador ni Android suspenden el proceso. |
+
+> En Android, con la aplicación minimizada, esto alarga bastante el tiempo que
+> sigue funcionando, pero **el sistema puede acabar suspendiéndola igualmente**.
+> Para que siga activa de forma indefinida haría falta un *foreground service*
+> nativo (código Java con una notificación permanente), que es el siguiente paso
+> si lo necesitas.
+
 ## Correcciones de la 1.2
 
 **No se podían crear canales en la aplicación de escritorio.** El nombre se pedía
@@ -36,8 +69,8 @@ publicada la web.
 
 | Archivo | Qué es |
 |---|---|
-| `installer/dist/WeasyTalkie_1.2.0_Setup.exe` (92 MB) | Aplicación de escritorio para Windows |
-| `installer/dist/WeasyTalkie_1.2.0.apk` (4 MB) | Aplicación para Android, **firmada para publicación** |
+| `installer/dist/WeasyTalkie_1.3.0_Setup.exe` (92 MB) | Aplicación de escritorio para Windows |
+| `installer/dist/WeasyTalkie_1.3.0.apk` (4 MB) | Aplicación para Android, **firmada para publicación** |
 
 **Escritorio (Windows).** Una ventana de Electron que abre la web; el audio va
 por WebRTC igual que en el navegador. Concede el permiso de micrófono sin
